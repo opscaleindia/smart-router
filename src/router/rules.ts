@@ -85,6 +85,13 @@ const AGENTIC_KEYWORDS = [
   "read file", "write file", "create file",
   "open", "close", "restart", "monitor",
   "automate", "schedule", "orchestrate",
+  // Git operations
+  "git ", "git push", "git pull", "git commit", "git merge",
+  "git checkout", "git clone", "git fetch", "git rebase",
+  "git stash", "git branch", "git tag", "git diff",
+  "git log", "git reset", "git cherry-pick", "git bisect",
+  "git init", "git add", "push to", "pull from",
+  "commit the", "merge the", "checkout to",
 ];
 
 const CONSTRAINT_KEYWORDS = [
@@ -382,11 +389,32 @@ function scoreToTier(score: number, config: ScoringConfig): Tier {
 
 /**
  * Check for reasoning keyword override: if the USER prompt (not system prompt)
- * contains 2+ reasoning keywords, force REASONING tier.
+ * contains 3+ reasoning keywords, force REASONING tier.
+ * Threshold raised from 2 to 3 to avoid false positives from casual usage
+ * of words like "hence", "therefore", "implies" in normal conversation.
  */
 function checkReasoningOverride(userPrompt: string): boolean {
   const hits = countKeywords(userPrompt, REASONING_KEYWORDS);
-  return hits >= 2;
+  return hits >= 3;
+}
+
+/** Git commands that indicate tool-execution tasks needing capable models. */
+const GIT_COMMAND_KEYWORDS = [
+  "git push", "git pull", "git commit", "git merge",
+  "git checkout", "git clone", "git fetch", "git rebase",
+  "git stash", "git branch", "git tag", "git reset",
+  "git cherry-pick", "git bisect", "git init", "git add",
+  "git diff", "git log",
+];
+
+/**
+ * Check for agentic/git override: if the prompt contains a git command,
+ * force at least COMPLEX tier so it routes to a model capable of
+ * tool use and command execution (e.g. Claude Sonnet, Gemini Pro).
+ */
+function checkAgenticOverride(userPrompt: string): boolean {
+  const hits = countKeywords(userPrompt, GIT_COMMAND_KEYWORDS);
+  return hits >= 1;
 }
 
 /** If token count > 100k, force COMPLEX tier minimum. */
@@ -416,6 +444,11 @@ export function estimateTokens(text: string): number {
 /**
  * Classify a request into a tier using the 14-dimension scoring system.
  *
+ * IMPORTANT: Scoring is based primarily on the USER PROMPT, not the system
+ * prompt. The system prompt is only used for specific dimensions where it
+ * matters (outputFormat, structuredOutput override). This prevents long
+ * system prompts (like agent instructions) from inflating the tier.
+ *
  * @param prompt - The user's prompt text.
  * @param systemPrompt - The system prompt, if any.
  * @param maxOutputTokens - Expected max output tokens (for cost estimation).
@@ -428,12 +461,15 @@ export function classifyByRules(
   maxOutputTokens: number = 4096,
   config: ScoringConfig = DEFAULT_SCORING_CONFIG,
 ): ScoringResult {
-  const combined = prompt + " " + systemPrompt;
-  const tokenEstimate = estimateTokens(combined) + maxOutputTokens;
+  // Token estimate uses only the user prompt + expected output.
+  // System prompts are controlled by the framework, not request complexity.
+  const tokenEstimate = estimateTokens(prompt) + maxOutputTokens;
 
-  // Score each dimension
+  // Score each dimension against the USER PROMPT only.
+  // The system prompt is passed through but individual scorers should
+  // only use it where explicitly needed (e.g., outputFormat).
   const signals: DimensionSignal[] = DIMENSIONS.map((dim) => {
-    const raw = clamp(dim.scorer(combined, systemPrompt, tokenEstimate));
+    const raw = clamp(dim.scorer(prompt, systemPrompt, tokenEstimate));
     return {
       dimension: dim.dimension,
       raw,
@@ -453,23 +489,30 @@ export function classifyByRules(
 
   // --- Overrides ---
 
-  // 1) 2+ reasoning keywords in user prompt → force REASONING
+  // 1) 3+ reasoning keywords in user prompt → force REASONING
+  //    (raised from 2 to reduce false positives from conversational text)
   if (checkReasoningOverride(prompt)) {
     tier = TierEnum.REASONING;
   }
 
-  // 2) >100k tokens → force at least COMPLEX
+  // 2) Git/agentic commands → force at least COMPLEX
+  //    These tasks need tool-capable models (Claude Sonnet, Gemini Pro)
+  if (checkAgenticOverride(prompt) && tierRank(tier) < tierRank(TierEnum.COMPLEX)) {
+    tier = TierEnum.COMPLEX;
+  }
+
+  // 3) >100k tokens → force at least COMPLEX
   const tokenOverride = checkTokenOverride(tokenEstimate);
   if (tokenOverride !== null && tierRank(tier) < tierRank(tokenOverride)) {
     tier = tokenOverride;
   }
 
-  // 3) Structured output in system prompt → minimum MEDIUM
+  // 4) Structured output in system prompt → minimum MEDIUM
   if (checkStructuredOutputOverride(systemPrompt) && tier === TierEnum.SIMPLE) {
     tier = TierEnum.MEDIUM;
   }
 
-  // 4) Ambiguous (low confidence) → default to MEDIUM
+  // 5) Ambiguous (low confidence) → default to MEDIUM
   if (confidence < config.ambiguityThreshold && tier === TierEnum.SIMPLE) {
     tier = TierEnum.MEDIUM;
   }

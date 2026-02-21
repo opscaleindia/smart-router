@@ -4,6 +4,8 @@
  * Defines 4 routing profiles (auto, eco, premium, free), each mapping
  * the 4 tiers to OpenRouter model IDs with fallback chains.
  * Also contains the default scoring config and model pricing registry.
+ *
+ * IMPORTANT: All models MUST support tool/function calling on OpenRouter.
  */
 
 import {
@@ -32,16 +34,17 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
 
 // ---------------------------------------------------------------------------
 // Model registry — OpenRouter model IDs with pricing
+// All models verified to support tool/function calling.
 // ---------------------------------------------------------------------------
 
 export const MODEL_REGISTRY: Record<string, ModelInfo> = {
   // --- Cheap / Simple tier models ---
-  "deepseek/deepseek-chat": {
-    id: "deepseek/deepseek-chat",
-    name: "DeepSeek V3",
-    inputPrice: 0.27,
-    outputPrice: 1.10,
-    contextWindow: 64000,
+  "google/gemini-2.0-flash-001": {
+    id: "google/gemini-2.0-flash-001",
+    name: "Gemini 2.0 Flash",
+    inputPrice: 0.10,
+    outputPrice: 0.40,
+    contextWindow: 1048576,
     maxOutput: 8192,
   },
   "google/gemini-2.5-flash": {
@@ -52,12 +55,12 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     contextWindow: 1048576,
     maxOutput: 65536,
   },
-  "google/gemini-2.0-flash-001": {
-    id: "google/gemini-2.0-flash-001",
-    name: "Gemini 2.0 Flash",
-    inputPrice: 0.10,
-    outputPrice: 0.40,
-    contextWindow: 1048576,
+  "deepseek/deepseek-chat-v3-0324": {
+    id: "deepseek/deepseek-chat-v3-0324",
+    name: "DeepSeek V3 0324",
+    inputPrice: 0.27,
+    outputPrice: 1.10,
+    contextWindow: 64000,
     maxOutput: 8192,
   },
 
@@ -70,28 +73,12 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     contextWindow: 128000,
     maxOutput: 16384,
   },
-  "anthropic/claude-haiku-3.5": {
-    id: "anthropic/claude-haiku-3.5",
+  "anthropic/claude-3.5-haiku": {
+    id: "anthropic/claude-3.5-haiku",
     name: "Claude 3.5 Haiku",
     inputPrice: 0.80,
     outputPrice: 4.00,
     contextWindow: 200000,
-    maxOutput: 8192,
-  },
-  "google/gemini-2.5-flash-preview": {
-    id: "google/gemini-2.5-flash-preview",
-    name: "Gemini 2.5 Flash Preview",
-    inputPrice: 0.15,
-    outputPrice: 0.60,
-    contextWindow: 1048576,
-    maxOutput: 65536,
-  },
-  "deepseek/deepseek-chat-v3-0324": {
-    id: "deepseek/deepseek-chat-v3-0324",
-    name: "DeepSeek V3 0324",
-    inputPrice: 0.27,
-    outputPrice: 1.10,
-    contextWindow: 64000,
     maxOutput: 8192,
   },
 
@@ -138,9 +125,9 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     contextWindow: 200000,
     maxOutput: 100000,
   },
-  "deepseek/deepseek-reasoner": {
-    id: "deepseek/deepseek-reasoner",
-    name: "DeepSeek R1",
+  "deepseek/deepseek-r1-0528": {
+    id: "deepseek/deepseek-r1-0528",
+    name: "DeepSeek R1 0528",
     inputPrice: 0.55,
     outputPrice: 2.19,
     contextWindow: 64000,
@@ -154,14 +141,6 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     contextWindow: 200000,
     maxOutput: 100000,
   },
-  "google/gemini-2.5-flash-thinking": {
-    id: "google/gemini-2.5-flash-thinking",
-    name: "Gemini 2.5 Flash Thinking",
-    inputPrice: 0.15,
-    outputPrice: 3.50,
-    contextWindow: 1048576,
-    maxOutput: 65536,
-  },
 
   // --- Baseline (for savings comparison) ---
   "anthropic/claude-opus-4": {
@@ -173,34 +152,34 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     maxOutput: 32000,
   },
 
-  // --- Free tier models ---
-  "meta-llama/llama-3.1-8b-instruct:free": {
-    id: "meta-llama/llama-3.1-8b-instruct:free",
-    name: "Llama 3.1 8B (Free)",
+  // --- Free tier models (all with tool calling support) ---
+  "meta-llama/llama-3.3-70b-instruct:free": {
+    id: "meta-llama/llama-3.3-70b-instruct:free",
+    name: "Llama 3.3 70B (Free)",
     inputPrice: 0,
     outputPrice: 0,
     contextWindow: 131072,
     maxOutput: 4096,
   },
-  "google/gemma-2-9b-it:free": {
-    id: "google/gemma-2-9b-it:free",
-    name: "Gemma 2 9B (Free)",
-    inputPrice: 0,
-    outputPrice: 0,
-    contextWindow: 8192,
-    maxOutput: 4096,
-  },
-  "mistralai/mistral-7b-instruct:free": {
-    id: "mistralai/mistral-7b-instruct:free",
-    name: "Mistral 7B (Free)",
+  "qwen/qwen3-4b:free": {
+    id: "qwen/qwen3-4b:free",
+    name: "Qwen3 4B (Free)",
     inputPrice: 0,
     outputPrice: 0,
     contextWindow: 32768,
     maxOutput: 4096,
   },
-  "qwen/qwen-2.5-7b-instruct:free": {
-    id: "qwen/qwen-2.5-7b-instruct:free",
-    name: "Qwen 2.5 7B (Free)",
+  "stepfun/step-3.5-flash:free": {
+    id: "stepfun/step-3.5-flash:free",
+    name: "Step 3.5 Flash (Free)",
+    inputPrice: 0,
+    outputPrice: 0,
+    contextWindow: 32768,
+    maxOutput: 4096,
+  },
+  "arcee-ai/trinity-large-preview:free": {
+    id: "arcee-ai/trinity-large-preview:free",
+    name: "Trinity Large Preview (Free)",
     inputPrice: 0,
     outputPrice: 0,
     contextWindow: 32768,
@@ -216,8 +195,8 @@ const AUTO_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
     primary: "google/gemini-2.0-flash-001",
     fallbacks: [
-      "deepseek/deepseek-chat",
       "google/gemini-2.5-flash",
+      "deepseek/deepseek-chat-v3-0324",
       "openai/gpt-4o-mini",
     ],
   },
@@ -225,7 +204,7 @@ const AUTO_PROFILE: ProfileConfig = {
     primary: "openai/gpt-4o-mini",
     fallbacks: [
       "google/gemini-2.5-flash",
-      "anthropic/claude-haiku-3.5",
+      "anthropic/claude-3.5-haiku",
       "deepseek/deepseek-chat-v3-0324",
     ],
   },
@@ -238,10 +217,9 @@ const AUTO_PROFILE: ProfileConfig = {
     ],
   },
   [Tier.REASONING]: {
-    primary: "deepseek/deepseek-reasoner",
+    primary: "deepseek/deepseek-r1-0528",
     fallbacks: [
       "openai/o3-mini",
-      "google/gemini-2.5-flash-thinking",
       "openai/o3",
     ],
   },
@@ -251,12 +229,12 @@ const ECO_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
     primary: "google/gemini-2.0-flash-001",
     fallbacks: [
-      "deepseek/deepseek-chat",
+      "deepseek/deepseek-chat-v3-0324",
       "google/gemini-2.5-flash",
     ],
   },
   [Tier.MEDIUM]: {
-    primary: "deepseek/deepseek-chat",
+    primary: "deepseek/deepseek-chat-v3-0324",
     fallbacks: [
       "google/gemini-2.5-flash",
       "openai/gpt-4o-mini",
@@ -270,9 +248,8 @@ const ECO_PROFILE: ProfileConfig = {
     ],
   },
   [Tier.REASONING]: {
-    primary: "deepseek/deepseek-reasoner",
+    primary: "deepseek/deepseek-r1-0528",
     fallbacks: [
-      "google/gemini-2.5-flash-thinking",
       "openai/o3-mini",
     ],
   },
@@ -282,7 +259,7 @@ const PREMIUM_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
     primary: "openai/gpt-4o-mini",
     fallbacks: [
-      "anthropic/claude-haiku-3.5",
+      "anthropic/claude-3.5-haiku",
       "google/gemini-2.5-flash",
     ],
   },
@@ -304,7 +281,7 @@ const PREMIUM_PROFILE: ProfileConfig = {
   [Tier.REASONING]: {
     primary: "openai/o3",
     fallbacks: [
-      "deepseek/deepseek-reasoner",
+      "deepseek/deepseek-r1-0528",
       "openai/o3-mini",
     ],
   },
@@ -312,31 +289,31 @@ const PREMIUM_PROFILE: ProfileConfig = {
 
 const FREE_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
-    primary: "meta-llama/llama-3.1-8b-instruct:free",
+    primary: "meta-llama/llama-3.3-70b-instruct:free",
     fallbacks: [
-      "google/gemma-2-9b-it:free",
-      "qwen/qwen-2.5-7b-instruct:free",
+      "qwen/qwen3-4b:free",
+      "stepfun/step-3.5-flash:free",
     ],
   },
   [Tier.MEDIUM]: {
-    primary: "meta-llama/llama-3.1-8b-instruct:free",
+    primary: "meta-llama/llama-3.3-70b-instruct:free",
     fallbacks: [
-      "mistralai/mistral-7b-instruct:free",
-      "qwen/qwen-2.5-7b-instruct:free",
+      "stepfun/step-3.5-flash:free",
+      "arcee-ai/trinity-large-preview:free",
     ],
   },
   [Tier.COMPLEX]: {
-    primary: "meta-llama/llama-3.1-8b-instruct:free",
+    primary: "meta-llama/llama-3.3-70b-instruct:free",
     fallbacks: [
-      "mistralai/mistral-7b-instruct:free",
-      "qwen/qwen-2.5-7b-instruct:free",
+      "arcee-ai/trinity-large-preview:free",
+      "stepfun/step-3.5-flash:free",
     ],
   },
   [Tier.REASONING]: {
-    primary: "meta-llama/llama-3.1-8b-instruct:free",
+    primary: "meta-llama/llama-3.3-70b-instruct:free",
     fallbacks: [
-      "qwen/qwen-2.5-7b-instruct:free",
-      "mistralai/mistral-7b-instruct:free",
+      "arcee-ai/trinity-large-preview:free",
+      "qwen/qwen3-4b:free",
     ],
   },
 };

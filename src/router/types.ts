@@ -172,3 +172,81 @@ export interface RoutingConfig {
   /** Model pricing registry. */
   models: Record<string, ModelInfo>;
 }
+
+// ---------------------------------------------------------------------------
+// Upstream result (proxy layer currency)
+// ---------------------------------------------------------------------------
+
+/** Standardized result from an upstream HTTP attempt. */
+export interface UpstreamResult {
+  /** HTTP status code from upstream. */
+  status: number;
+  /** Response headers from upstream. */
+  headers: Record<string, string | string[] | undefined>;
+  /** Buffered response body. */
+  body: Buffer;
+  /** Model ID that was attempted. */
+  model: string;
+  /** Zero-based index in the fallback chain. */
+  attemptIndex: number;
+}
+
+// ---------------------------------------------------------------------------
+// Proxy feature flags
+// ---------------------------------------------------------------------------
+
+/** Boolean flags to independently toggle proxy resilience features. */
+export interface ProxyFeatureFlags {
+  /** Retry through fallback chain on upstream errors. */
+  fallbackRetry: boolean;
+  /** Track 429s and deprioritize rate-limited models. */
+  rateLimitTracking: boolean;
+  /** Detect fake-200 degraded responses and retry. */
+  degradedDetection: boolean;
+  /** Coalesce duplicate in-flight requests. */
+  requestDedup: boolean;
+  /** Cache successful non-streaming responses. */
+  responseCache: boolean;
+}
+
+/** Default: all features enabled. */
+export const DEFAULT_PROXY_FEATURES: ProxyFeatureFlags = {
+  fallbackRetry: true,
+  rateLimitTracking: true,
+  degradedDetection: true,
+  requestDedup: true,
+  responseCache: true,
+};
+
+// ---------------------------------------------------------------------------
+// Degraded detection
+// ---------------------------------------------------------------------------
+
+/** Result of checking a response for degraded content. */
+export interface DegradedCheckResult {
+  /** Whether the response appears degraded. */
+  isDegraded: boolean;
+  /** The pattern that matched, or null. */
+  matchedPattern: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Cache configuration
+// ---------------------------------------------------------------------------
+
+/** Configuration for the response cache. */
+export interface CacheConfig {
+  /** Maximum number of cached entries. */
+  maxEntries: number;
+  /** Time-to-live in milliseconds. */
+  ttlMs: number;
+  /** Maximum body size in bytes for a single cache entry. */
+  maxEntrySize: number;
+}
+
+/** Default cache settings. */
+export const DEFAULT_CACHE_CONFIG: CacheConfig = {
+  maxEntries: 200,
+  ttlMs: 600_000, // 10 minutes
+  maxEntrySize: 1_048_576, // 1 MB
+};

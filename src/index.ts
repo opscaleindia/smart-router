@@ -24,6 +24,8 @@ export {
   DEFAULT_SCORING_CONFIG,
   MODEL_REGISTRY,
   BASELINE_MODEL_ID,
+  DEFAULT_PROXY_FEATURES,
+  DEFAULT_CACHE_CONFIG,
 } from "./router/index.js";
 
 export type {
@@ -40,4 +42,16 @@ export type {
   ModelInfo,
   CostEstimate,
   TierBoundaries,
+  UpstreamResult,
+  ProxyFeatureFlags,
+  DegradedCheckResult,
+  CacheConfig,
 } from "./router/index.js";
+
+// Proxy resilience features
+export { RateLimiter } from "./rate-limiter.js";
+export { checkDegraded, DEGRADED_PATTERNS } from "./degraded-detector.js";
+export { ResponseCache } from "./cache.js";
+export { RequestDedup } from "./dedup.js";
+export { createProxyServer } from "./proxy.js";
+export type { ProxyServerOptions } from "./proxy.js";
