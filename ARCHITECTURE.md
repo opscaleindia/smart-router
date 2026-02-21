@@ -2,7 +2,7 @@
 
 ## Abstract
 
-`@openclaw/smart-router` is an in-house LLM request router that sits between client applications and upstream LLM providers. It integrates with OpenClaw's provider system to discover available models and auth, then routes each request to the cheapest capable model. The router solves two problems: *model selection* (picking the cheapest capable model for each request) and *delivery resilience* (ensuring the request succeeds even when individual upstream providers fail). It does both with zero external dependencies — only Node.js standard library.
+`@openclaw/smart-router` is an in-house LLM request router that sits between client applications and upstream LLM providers. It integrates with OpenClaw's provider system to discover available models and auth, then routes each request to the cheapest capable model. The router solves three problems: *model selection* (picking the cheapest capable model for each request), *delivery resilience* (ensuring the request succeeds even when individual upstream providers fail), and *token efficiency* (compressing context, pinning sessions, and recording action journals to reduce costs and improve multi-turn coherence). It does all of this with zero external dependencies — only Node.js standard library.
 
 This document explains every feature in the system, the design rationale behind each, and why the specific implementation choices produce correct behavior under real production conditions.
 
@@ -20,9 +20,13 @@ This document explains every feature in the system, the design rationale behind 
 8. [Degraded Response Detection](#8-degraded-response-detection)
 9. [Response Caching](#9-response-caching)
 10. [Request Deduplication](#10-request-deduplication)
-11. [Streaming Strategy](#11-streaming-strategy)
-12. [Feature Coordination in the Proxy](#12-feature-coordination-in-the-proxy)
-13. [Design Principles](#13-design-principles)
+11. [Timestamp Stripping](#11-timestamp-stripping)
+12. [Context Compression](#12-context-compression)
+13. [Session Tracking](#13-session-tracking)
+14. [Session Journal](#14-session-journal)
+15. [Streaming Strategy](#15-streaming-strategy)
+16. [Feature Coordination in the Proxy](#16-feature-coordination-in-the-proxy)
+17. [Design Principles](#17-design-principles)
 
 ---
 
@@ -45,32 +49,38 @@ Client (OpenAI SDK, curl, any HTTP client)
 │  │   Registry      │   (hostname, port, path, API key)               │
 │  └───────┬────────┘                                                  │
 │          │                                                           │
-│  ┌────────────┐   ┌────────────┐   ┌───────────┐   ┌─────────────┐ │
-│  │  Classifier │──▶│  Selector  │──▶│ Rate Limit│──▶│ Dedup Check │ │
-│  │ (15-dim)    │   │ (profile)  │   │ Reorder   │   │             │ │
-│  └────────────┘   └────────────┘   └───────────┘   └──────┬──────┘ │
-│                                                            │        │
-│                                                     ┌──────▼──────┐ │
-│                                                     │ Cache Check │ │
-│                                                     └──────┬──────┘ │
-│                                                            │        │
-│                                                     ┌──────▼──────┐ │
-│                                                     │  Fallback   │ │
-│                                                     │    Loop     │ │
-│                                                     │  (up to 5   │ │
-│                                                     │   models)   │ │
-│                                                     └──────┬──────┘ │
-│                                                            │        │
-│                                                     ┌──────▼──────┐ │
-│                                                     │  Degraded   │ │
-│                                                     │  Detection  │ │
-│                                                     └──────┬──────┘ │
-│                                                            │        │
-│                                                     ┌──────▼──────┐ │
-│                                                     │   Cache     │ │
-│                                                     │   Store +   │ │
-│                                                     │ Dedup Resolve│ │
-│                                                     └─────────────┘ │
+│  ┌────────────┐   ┌────────────┐   ┌───────────┐                   │
+│  │  Classifier │──▶│  Selector  │──▶│  Session  │                   │
+│  │ (15-dim)    │   │ (profile)  │   │  Check    │                   │
+│  └────────────┘   └────────────┘   └─────┬─────┘                   │
+│                                           │                         │
+│  ┌────────────┐   ┌────────────┐   ┌─────▼─────┐   ┌───────────┐  │
+│  │  Journal    │──▶│  Context   │──▶│ Rate Limit│──▶│Dedup Check│  │
+│  │  Injection  │   │ Compress   │   │ Reorder   │   │(+ts strip)│  │
+│  └────────────┘   └────────────┘   └───────────┘   └─────┬─────┘  │
+│                                                           │         │
+│                                                    ┌──────▼──────┐  │
+│                                                    │ Cache Check │  │
+│                                                    │ (+ts strip) │  │
+│                                                    └──────┬──────┘  │
+│                                                           │         │
+│                                                    ┌──────▼──────┐  │
+│                                                    │  Fallback   │  │
+│                                                    │    Loop     │  │
+│                                                    │  (up to 5   │  │
+│                                                    │   models)   │  │
+│                                                    └──────┬──────┘  │
+│                                                           │         │
+│                                                    ┌──────▼──────┐  │
+│                                                    │  Degraded   │  │
+│                                                    │  Detection  │  │
+│                                                    └──────┬──────┘  │
+│                                                           │         │
+│                                                    ┌──────▼──────┐  │
+│                                                    │ Cache Store │  │
+│                                                    │ Dedup Resolve│ │
+│                                                    │ Journal Rec │  │
+│                                                    └─────────────┘  │
 └──────────────────────────────────────────────────────────────────────┘
   │
   ▼ (Provider Registry resolves each model to its best provider)
@@ -501,7 +511,147 @@ Like degraded detection, dedup requires buffering the complete response to distr
 
 ---
 
-## 11. Streaming Strategy
+## 11. Timestamp Stripping
+
+### What it does
+
+OpenClaw injects timestamps into message content in the format `[SUN 2026-02-07 13:30 PST]` at the beginning of user messages. When a request is retried (e.g., due to a network timeout on the client side), the retry has a different timestamp but identical content. Without timestamp stripping, the cache and dedup systems treat these as different requests, wasting the cache hit and creating redundant upstream calls.
+
+### How it works
+
+Both `ResponseCache.computeKey()` and `RequestDedup.computeKey()` pass the normalized request body through `stripTimestamps()` before hashing. This function recursively walks the object structure and applies a regex to any `content` string field:
+
+```
+TIMESTAMP_PATTERN = /^\[\w{3}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+\w+\]\s*/
+```
+
+The pattern only matches at the start of a string (`^`), so timestamps embedded mid-content are not affected. The stripping is applied only during key computation — the actual message content sent upstream is never modified.
+
+### Why recursive object walking
+
+The `messages` field is an array of objects, each with a `content` field. The `stripTimestamps` function recurses into arrays and objects, but only applies the regex replacement when it encounters a key named `content` with a string value. This ensures timestamps are stripped from all message positions (system, user, assistant) without affecting other fields like `model` or `temperature`.
+
+---
+
+## 12. Context Compression
+
+### What it does
+
+The 7-layer compression pipeline (`src/compression/`) reduces token usage by 15-40% on large conversations while preserving semantic meaning. It runs automatically on messages exceeding 5000 characters (~1000 tokens) before the request is forwarded upstream.
+
+### The 7 layers
+
+| Layer | Name | Default | What it does | Expected savings |
+|-------|------|---------|--------------|------------------|
+| 1 | Deduplication | **On** | MD5-hashes assistant messages and removes exact duplicates. Never deduplicates system, user, or tool messages. Preserves tool_use/tool_result pairing. | 2-5% |
+| 2 | Whitespace | **On** | Max 2 consecutive newlines, trim trailing spaces, normalize tabs to 2 spaces, reduce excessive indentation (>8 spaces). | 3-8% |
+| 3 | Dictionary | Off | Replaces 84 common phrases (XML tags, JSON schema patterns, role markers) with short `$XX` codes using a static codebook. Longest-first matching prevents partial replacements. | 4-8% |
+| 4 | Paths | Off | Detects filesystem path prefixes appearing 3+ times and shortens them to `$P1/`, `$P2/` codes. Max 5 path codes. | 1-3% |
+| 5 | JSON Compact | **On** | Parses and re-stringifies JSON in tool_call arguments and tool message content, removing pretty-print whitespace. | 2-4% |
+| 6 | Observation | Off | Compresses tool results >500 chars down to ~300 chars by extracting errors, status lines, key JSON fields, and first/last lines. | Up to 97% on individual tool results |
+| 7 | Dynamic Codebook | Off | Learns repeated phrases (≥20 chars, 3+ occurrences) from the actual content and replaces them with `$D01`-style codes. | Variable |
+
+### Why conservative defaults
+
+Layers 1, 2, and 5 are enabled by default because they are *semantically transparent* — the LLM receives equivalent information. Layers 3, 4, 6, and 7 are disabled because they require the LLM to understand codebook substitutions or accept lossy compression of tool results. They can be enabled for specific use cases where token savings outweigh the slight reduction in context fidelity.
+
+### Codebook header placement
+
+When dictionary or path encoding is active with `includeCodebookHeader: true`, the codebook legend is prepended to the first **user** message, not the system message. This is a deliberate compatibility choice — Google Gemini's `systemInstruction` field doesn't support codebook format, but user messages work across all providers.
+
+### Multimodal safety
+
+Every layer guards `typeof msg.content === "string"` before processing. Messages with array content (multimodal images, etc.) pass through all layers untouched. This prevents corruption of image URLs or structured content parts.
+
+### Integration point
+
+Compression runs in `handleChatCompletions()` after journal injection and before dedup/cache checks. This means compressed content is what gets cached and deduped — subsequent identical requests benefit from both compression and caching without re-running the compression pipeline.
+
+---
+
+## 13. Session Tracking
+
+### What it does
+
+The `SessionStore` (`src/session.ts`) pins a model to a session ID, preventing the router from switching models mid-task. Without session tracking, each request in a multi-turn conversation could route to a different model based on the latest message's classification — causing inconsistent behavior, context loss (different models have different context windows), and jarring quality shifts.
+
+### How it works
+
+1. Client sends `X-Session-ID` header with each request (typically an agent session identifier).
+2. First request with a new session ID: route normally, then pin the selected model to the session.
+3. Subsequent requests with the same session ID: skip `route()` and use the pinned model directly.
+4. Sessions expire after 30 minutes of inactivity (configurable via `timeoutMs`).
+
+### Session lifecycle
+
+```
+Request arrives with X-Session-ID: "abc123"
+  → SessionStore.getSession("abc123")
+  → Found? Use pinned model, touchSession() to extend timeout
+  → Not found? route() normally, setSession("abc123", model, tier)
+```
+
+### Why timeout-based expiry
+
+Agent sessions typically run for minutes to hours, then go idle. A 30-minute timeout covers most active sessions while automatically cleaning up abandoned ones. The `touchSession()` call on each request resets the timeout, so an active session never expires regardless of total duration.
+
+### Auto-cleanup
+
+A background interval runs every 5 minutes (only when session tracking is enabled) to remove expired sessions from memory. This prevents memory leaks from accumulated stale sessions.
+
+### Model updates
+
+If a session's pinned model fails and a fallback model succeeds, `setSession()` can be called again to update the pinned model. The session retains its original creation time and increments its request counter.
+
+---
+
+## 14. Session Journal
+
+### What it does
+
+The `SessionJournal` (`src/journal.ts`) maintains a compact record of key actions per session, enabling agents to recall earlier work even when conversation history is truncated. It extracts events from LLM responses ("I created X", "I fixed Y") and injects them when the user asks about past work.
+
+### Event extraction
+
+Six regex patterns scan assistant response content for action statements:
+
+| Pattern | Matches |
+|---------|---------|
+| Creation | "I created/implemented/added/wrote/built..." |
+| Fix | "I fixed/resolved/solved/patched..." |
+| Completion | "I completed/finished/wrapped up..." |
+| Update | "I updated/modified/changed/refactored..." |
+| Success | "Successfully deployed/configured/..." |
+| Tool usage | "I ran/executed/called/invoked..." |
+
+Each pattern allows optional filler words ("also", "then", "have") between "I" and the verb. Extracted actions must be 15-200 characters. Duplicates are removed via case-insensitive dedup. At most 5 events are extracted per response.
+
+### Context injection
+
+When a user message contains trigger phrases ("what did you do", "earlier", "summarize", "your progress", etc.), the journal is formatted and injected into the system message:
+
+```
+[Session Memory - Key Actions]
+- 02:15 PM: I created the login component and auth flow
+- 02:23 PM: I fixed the session timeout bug
+- 02:30 PM: I updated the database schema for user roles
+```
+
+### Limits
+
+| Limit | Value | Rationale |
+|-------|-------|-----------|
+| Max entries per session | 100 | Prevents unbounded memory growth for long sessions |
+| Max age | 24 hours | Stale entries from yesterday's session are not useful |
+| Max events per response | 5 | Prevents verbose responses from flooding the journal |
+
+### Why not full conversation history
+
+Full conversation history can be megabytes of data across a long session. The journal distills this to ~100 one-line summaries of *what was accomplished*, which is exactly what users ask about. This compact representation fits in a few hundred tokens of system message injection.
+
+---
+
+## 15. Streaming Strategy
 
 Streaming (SSE) requests follow a fundamentally different path than non-streaming requests because SSE commits the HTTP response the moment the first byte is piped to the client. The proxy handles this with a two-phase approach:
 
@@ -527,7 +677,7 @@ All three features silently deactivate for streaming requests without needing ex
 
 ---
 
-## 12. Feature Coordination in the Proxy
+## 16. Feature Coordination in the Proxy
 
 ### The `ProxyContext`
 
@@ -540,12 +690,15 @@ interface ProxyContext {
   cache: ResponseCache;
   dedup: RequestDedup;
   providers: ProviderRegistry;
+  sessionStore: SessionStore;
+  journal: SessionJournal;
+  compressionConfig: CompressionConfig;
 }
 ```
 
 This design avoids module-level singletons, making testing clean: each test can create its own proxy with independent feature state. It also means multiple proxy instances in the same process (e.g., different ports with different configurations) don't share state.
 
-The `ProviderRegistry` is part of the context because it holds the loaded OpenClaw config and provider keys — these are per-proxy-instance, not global.
+The `ProviderRegistry` is part of the context because it holds the loaded OpenClaw config and provider keys — these are per-proxy-instance, not global. Similarly, `SessionStore` and `SessionJournal` hold per-instance state with independent cleanup timers.
 
 ### Feature flags
 
@@ -553,35 +706,48 @@ Every feature can be independently toggled via `ProxyFeatureFlags`:
 
 ```typescript
 interface ProxyFeatureFlags {
-  fallbackRetry: boolean;
-  rateLimitTracking: boolean;
-  degradedDetection: boolean;
-  requestDedup: boolean;
-  responseCache: boolean;
+  fallbackRetry: boolean;       // default: true
+  rateLimitTracking: boolean;   // default: true
+  degradedDetection: boolean;   // default: true
+  requestDedup: boolean;        // default: true
+  responseCache: boolean;       // default: true
+  contextCompression: boolean;  // default: true
+  sessionTracking: boolean;     // default: false
+  sessionJournal: boolean;      // default: false
 }
 ```
 
-All default to `true`. This lets operators disable specific features during debugging or performance testing without touching code. For example, `{ responseCache: false }` disables caching while keeping all other features active.
+The original 5 resilience features default to `true`. Context compression also defaults to `true` (with conservative layer defaults). Session tracking and session journal default to `false` because they require clients to send `X-Session-ID` headers — enabling them without header support is a no-op but wastes memory on cleanup timers.
+
+This lets operators disable specific features during debugging or performance testing without touching code. For example, `{ responseCache: false }` disables caching while keeping all other features active.
 
 ### Request lifecycle (non-streaming)
 
 The full processing pipeline for a non-streaming request:
 
 ```
-1. Parse request body
-2. Extract user message + system prompt
-3. Classify via 15-dimension scorer → ScoringResult
-4. Apply overrides → final Tier
-5. Select model via profile → RoutingDecision (primary + fallbacks)
-6. Build model chain [primary, ...fallbacks], cap at 5
-7. Rate limit reorder: stable-partition non-limited models first
-8. Dedup acquire:
-   - "waiting" → await coalesced result → return to client
-   - "new" → proceed (we're the owner)
-9. Cache check:
-   - hit → resolve dedup + return cached result
-   - miss → proceed
-10. Fallback loop (for each model):
+ 1. Parse request body
+ 2. Extract user message + system prompt
+ 3. Classify via 15-dimension scorer → ScoringResult
+ 4. Apply overrides → final Tier
+ 5. (A) Session check:
+    - X-Session-ID present + session exists → use pinned model, skip route()
+    - X-Session-ID present + no session → route(), pin result to session
+    - No session ID → route() normally
+ 6. Select model via profile → RoutingDecision (primary + fallbacks)
+ 7. (B) Journal injection:
+    - Session journal enabled + user asks about past work → inject journal into system message
+ 8. (C) Context compression:
+    - Messages > 5000 chars → run 7-layer compression pipeline, replace messages
+ 9. Build model chain [primary, ...fallbacks], cap at 5
+10. Rate limit reorder: stable-partition non-limited models first
+11. Dedup acquire (key computed with timestamp stripping):
+    - "waiting" → await coalesced result → return to client
+    - "new" → proceed (we're the owner)
+12. Cache check (key computed with timestamp stripping):
+    - hit → resolve dedup + return cached result
+    - miss → proceed
+13. Fallback loop (for each model):
     a. Resolve model to upstream target via ProviderRegistry
     b. Forward to target (buffer entire response)
     c. If 429 → record rate limit
@@ -589,8 +755,9 @@ The full processing pipeline for a non-streaming request:
     e. If 200 → run degraded detection:
        - degraded → log, continue to next model
        - clean → cache result, resolve dedup, return to client
-    f. If non-retriable error (400, 401, etc.) → break loop
-11. Exhausted → resolve/reject dedup with last result, return to client
+    f. (D) Journal recording: extract events from assistant response, record to journal
+    g. If non-retriable error (400, 401, etc.) → break loop
+14. Exhausted → resolve/reject dedup with last result, return to client
 ```
 
 ### Response headers
@@ -610,7 +777,7 @@ These headers are invaluable for debugging, monitoring, and understanding routin
 
 ---
 
-## 13. Design Principles
+## 17. Design Principles
 
 ### Zero dependencies
 

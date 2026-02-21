@@ -9,7 +9,12 @@
 
 import { createProxyServer } from "./proxy.js";
 
-const proxy = createProxyServer();
+const proxy = createProxyServer({
+  features: {
+    sessionTracking: true,
+    sessionJournal: true,
+  },
+});
 
 proxy.start().then(() => {
   const providerStatus = proxy.ctx.providers.status();
