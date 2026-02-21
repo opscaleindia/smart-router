@@ -26,6 +26,7 @@ export {
   BASELINE_MODEL_ID,
   DEFAULT_PROXY_FEATURES,
   DEFAULT_CACHE_CONFIG,
+  DEFAULT_COMPRESSION_CONFIG,
 } from "./router/index.js";
 
 export type {
@@ -46,6 +47,7 @@ export type {
   ProxyFeatureFlags,
   DegradedCheckResult,
   CacheConfig,
+  CompressionConfig,
 } from "./router/index.js";
 
 // Proxy resilience features
@@ -63,3 +65,21 @@ export type { ResolvedTarget } from "./providers.js";
 // OpenClaw config integration
 export { loadOpenClawConfig, OPENCLAW_BUILTIN_PROVIDERS } from "./openclaw-loader.js";
 export type { OpenClawConfig, OpenClawAuthProfile, OpenClawCustomProvider } from "./openclaw-loader.js";
+
+// Session tracking
+export { SessionStore, getSessionId } from "./session.js";
+export type { SessionEntry, SessionConfig } from "./session.js";
+
+// Session journal
+export { SessionJournal } from "./journal.js";
+export type { JournalEntry, SessionJournalConfig } from "./journal.js";
+
+// Compression
+export { compressContext, shouldCompress, STATIC_CODEBOOK } from "./compression/index.js";
+export type {
+  NormalizedMessage,
+  ContentPart,
+  ToolCall,
+  CompressionResult,
+  CompressionStats,
+} from "./compression/index.js";

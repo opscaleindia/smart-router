@@ -153,4 +153,34 @@ function makeResult(overrides: Partial<UpstreamResult> = {}): UpstreamResult {
   console.log("✅ Clear removes all entries");
 }
 
+// Timestamp stripping — same content with different timestamps produce same key
+{
+  const cache = new ResponseCache();
+  const key1 = cache.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[SUN 2026-02-07 13:30 PST] What is 2+2?" }],
+  });
+  const key2 = cache.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[MON 2026-02-08 14:45 EST] What is 2+2?" }],
+  });
+  assert.strictEqual(key1, key2);
+  console.log("✅ Timestamp stripping produces same cache key");
+}
+
+// Timestamp stripping — different content still produces different keys
+{
+  const cache = new ResponseCache();
+  const key1 = cache.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[SUN 2026-02-07 13:30 PST] What is 2+2?" }],
+  });
+  const key2 = cache.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[SUN 2026-02-07 13:30 PST] What is 3+3?" }],
+  });
+  assert.notStrictEqual(key1, key2);
+  console.log("✅ Different content with timestamps still produces different keys");
+}
+
 console.log("\n🎉 All cache tests passed!\n");

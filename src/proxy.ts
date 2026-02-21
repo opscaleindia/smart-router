@@ -11,8 +11,8 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { route, MODEL_REGISTRY } from "./index.js";
-import type { RoutingProfile, UpstreamResult, ProxyFeatureFlags, CacheConfig } from "./router/types.js";
-import { DEFAULT_PROXY_FEATURES, DEFAULT_CACHE_CONFIG } from "./router/types.js";
+import type { RoutingProfile, UpstreamResult, ProxyFeatureFlags, CacheConfig, CompressionConfig } from "./router/types.js";
+import { DEFAULT_PROXY_FEATURES, DEFAULT_CACHE_CONFIG, DEFAULT_COMPRESSION_CONFIG } from "./router/types.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { checkDegraded } from "./degraded-detector.js";
 import { ResponseCache } from "./cache.js";
@@ -23,6 +23,9 @@ import {
   forwardStreamingToTarget,
 } from "./providers.js";
 import { loadOpenClawConfig, type OpenClawConfig } from "./openclaw-loader.js";
+import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
+import { SessionJournal } from "./journal.js";
+import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
 
 const MAX_FALLBACK_CHAIN = 5;
 
@@ -162,6 +165,9 @@ interface ProxyContext {
   cache: ResponseCache;
   dedup: RequestDedup;
   providers: ProviderRegistry;
+  sessionStore: SessionStore;
+  journal: SessionJournal;
+  compressionConfig: CompressionConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,8 +212,58 @@ async function handleChatCompletions(
     profile = body.model as RoutingProfile;
   }
 
-  // Route the request
-  const decision = route(userMessage, systemPrompt, maxTokens, { profile });
+  // --- (A) Session check: use pinned model if available ---
+  const sessionId = getSessionId(req.headers as Record<string, string | string[] | undefined>);
+  let decision;
+  if (ctx.features.sessionTracking && sessionId) {
+    const existingSession = ctx.sessionStore.getSession(sessionId);
+    if (existingSession) {
+      // Use pinned model — skip route()
+      decision = route(userMessage, systemPrompt, maxTokens, { profile });
+      decision = { ...decision, model: existingSession.model };
+      ctx.sessionStore.touchSession(sessionId);
+      log(`Session ${sessionId.slice(0, 8)}... pinned to ${existingSession.model}`);
+    } else {
+      decision = route(userMessage, systemPrompt, maxTokens, { profile });
+      ctx.sessionStore.setSession(sessionId, decision.model, decision.tier);
+    }
+  } else {
+    decision = route(userMessage, systemPrompt, maxTokens, { profile });
+  }
+
+  // --- (B) Journal injection: if user asks about past work ---
+  if (ctx.features.sessionJournal && sessionId && ctx.journal.needsContext(userMessage)) {
+    const journalText = ctx.journal.format(sessionId);
+    if (journalText && Array.isArray(body.messages)) {
+      // Find system message and inject journal
+      const sysIdx = body.messages.findIndex((m: any) => m.role === "system");
+      if (sysIdx >= 0 && typeof body.messages[sysIdx].content === "string") {
+        body.messages[sysIdx].content = journalText + "\n\n" + body.messages[sysIdx].content;
+      } else {
+        // Prepend as new system message
+        body.messages.unshift({ role: "system", content: journalText });
+      }
+      rawBody = JSON.stringify(body);
+    }
+  }
+
+  // --- (C) Context compression ---
+  if (ctx.features.contextCompression && ctx.compressionConfig.enabled && Array.isArray(body.messages)) {
+    if (shouldCompress(body.messages as NormalizedMessage[])) {
+      try {
+        const compressionResult = await compressContext(
+          body.messages as NormalizedMessage[],
+          ctx.compressionConfig,
+        );
+        const savedPct = ((1 - compressionResult.compressionRatio) * 100).toFixed(1);
+        log(`Compressed ${compressionResult.originalChars} → ${compressionResult.compressedChars} chars (${savedPct}% saved)`);
+        body.messages = compressionResult.messages;
+        rawBody = JSON.stringify(body);
+      } catch (err: any) {
+        log(`Compression error (skipped): ${err.message}`);
+      }
+    }
+  }
 
   // Get authorization header (used as passthrough for OpenRouter)
   const authHeader = req.headers["authorization"];
@@ -372,13 +428,31 @@ async function handleChatCompletions(
           }
         }
 
-        // Success — cache and resolve dedup
+        // Success — cache, resolve dedup, and record journal
         if (cacheKey && ctx.features.responseCache) {
           ctx.cache.set(cacheKey, result);
         }
         if (dedupKey) {
           ctx.dedup.resolve(dedupKey, result);
         }
+
+        // --- (D) Journal recording: extract events from response ---
+        if (ctx.features.sessionJournal && sessionId) {
+          try {
+            const responseStr = result.body.toString("utf-8");
+            const parsed = JSON.parse(responseStr);
+            const assistantContent = parsed?.choices?.[0]?.message?.content;
+            if (typeof assistantContent === "string") {
+              const events = ctx.journal.extractEvents(assistantContent);
+              if (events.length > 0) {
+                ctx.journal.record(sessionId, events, model);
+              }
+            }
+          } catch {
+            // Non-JSON or malformed — skip journal recording
+          }
+        }
+
         writeUpstreamResult(res, result, routingHeaders);
         return;
       }
@@ -421,7 +495,7 @@ function createRequestHandler(ctx: ProxyContext) {
       res.writeHead(204, {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Smart-Router-Profile, X-Title",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Smart-Router-Profile, X-Title, X-Session-ID",
       });
       res.end();
       return;
@@ -459,6 +533,10 @@ export interface ProxyServerOptions {
   dedupTtlMs?: number;
   /** Pre-loaded OpenClaw config (if omitted, reads from disk). */
   openclawConfig?: OpenClawConfig;
+  /** Session persistence config. */
+  sessionConfig?: Partial<SessionConfig>;
+  /** Context compression config. */
+  compressionConfig?: Partial<CompressionConfig>;
 }
 
 export function createProxyServer(options: ProxyServerOptions = {}) {
@@ -472,12 +550,33 @@ export function createProxyServer(options: ProxyServerOptions = {}) {
   const openclawConfig = options.openclawConfig ?? loadOpenClawConfig();
   const providers = new ProviderRegistry(openclawConfig);
 
+  const compressionConfig: CompressionConfig = {
+    ...DEFAULT_COMPRESSION_CONFIG,
+    ...options.compressionConfig,
+    layers: {
+      ...DEFAULT_COMPRESSION_CONFIG.layers,
+      ...options.compressionConfig?.layers,
+    },
+    dictionary: {
+      ...DEFAULT_COMPRESSION_CONFIG.dictionary,
+      ...options.compressionConfig?.dictionary,
+    },
+  };
+
+  const sessionStore = new SessionStore({
+    enabled: features.sessionTracking,
+    ...options.sessionConfig,
+  });
+
   const ctx: ProxyContext = {
     features,
     rateLimiter: new RateLimiter(options.rateLimitCooldownMs),
     cache: new ResponseCache(options.cacheConfig),
     dedup: new RequestDedup(options.dedupTtlMs),
     providers,
+    sessionStore,
+    journal: new SessionJournal(),
+    compressionConfig,
   };
 
   const server = createServer(createRequestHandler(ctx));
@@ -493,6 +592,7 @@ export function createProxyServer(options: ProxyServerOptions = {}) {
       });
     },
     stop(): Promise<void> {
+      ctx.sessionStore.close();
       return new Promise((resolve) => {
         server.close(() => resolve());
       });

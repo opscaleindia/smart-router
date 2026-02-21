@@ -207,6 +207,12 @@ export interface ProxyFeatureFlags {
   requestDedup: boolean;
   /** Cache successful non-streaming responses. */
   responseCache: boolean;
+  /** Compress context to reduce token usage. */
+  contextCompression: boolean;
+  /** Pin models to sessions to prevent mid-task switching. */
+  sessionTracking: boolean;
+  /** Record and inject session action journals. */
+  sessionJournal: boolean;
 }
 
 /** Default: all features enabled. */
@@ -216,6 +222,53 @@ export const DEFAULT_PROXY_FEATURES: ProxyFeatureFlags = {
   degradedDetection: true,
   requestDedup: true,
   responseCache: true,
+  contextCompression: true,
+  sessionTracking: false,
+  sessionJournal: false,
+};
+
+// ---------------------------------------------------------------------------
+// Compression configuration
+// ---------------------------------------------------------------------------
+
+/** Per-layer toggles and settings for context compression. */
+export interface CompressionConfig {
+  enabled: boolean;
+  preserveRaw: boolean;
+  layers: {
+    deduplication: boolean;
+    whitespace: boolean;
+    dictionary: boolean;
+    paths: boolean;
+    jsonCompact: boolean;
+    observation: boolean;
+    dynamicCodebook: boolean;
+  };
+  dictionary: {
+    maxEntries: number;
+    minPhraseLength: number;
+    includeCodebookHeader: boolean;
+  };
+}
+
+/** Conservative defaults — only safe layers enabled. */
+export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
+  enabled: true,
+  preserveRaw: true,
+  layers: {
+    deduplication: true,
+    whitespace: true,
+    dictionary: false,
+    paths: false,
+    jsonCompact: true,
+    observation: false,
+    dynamicCodebook: false,
+  },
+  dictionary: {
+    maxEntries: 50,
+    minPhraseLength: 15,
+    includeCodebookHeader: false,
+  },
 };
 
 // ---------------------------------------------------------------------------

@@ -137,4 +137,34 @@ function makeResult(overrides: Partial<UpstreamResult> = {}): UpstreamResult {
   console.log("✅ computeKey normalizes request body");
 }
 
+// Timestamp stripping — same content with different timestamps produce same key
+{
+  const dedup = new RequestDedup();
+  const key1 = dedup.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[SUN 2026-02-07 13:30 PST] What is 2+2?" }],
+  });
+  const key2 = dedup.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[MON 2026-02-08 14:45 EST] What is 2+2?" }],
+  });
+  assert.strictEqual(key1, key2);
+  console.log("✅ Timestamp stripping produces same dedup key");
+}
+
+// Timestamp stripping — different content still produces different keys
+{
+  const dedup = new RequestDedup();
+  const key1 = dedup.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[SUN 2026-02-07 13:30 PST] What is 2+2?" }],
+  });
+  const key2 = dedup.computeKey({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "[SUN 2026-02-07 13:30 PST] What is 3+3?" }],
+  });
+  assert.notStrictEqual(key1, key2);
+  console.log("✅ Different content with timestamps still produces different keys");
+}
+
 console.log("\n🎉 All dedup tests passed!\n");

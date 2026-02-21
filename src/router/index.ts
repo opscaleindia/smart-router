@@ -62,7 +62,7 @@ export {
   MODEL_REGISTRY,
   BASELINE_MODEL_ID,
 } from "./config.js";
-export { Tier, DEFAULT_PROXY_FEATURES, DEFAULT_CACHE_CONFIG } from "./types.js";
+export { Tier, DEFAULT_PROXY_FEATURES, DEFAULT_CACHE_CONFIG, DEFAULT_COMPRESSION_CONFIG } from "./types.js";
 export type {
   RoutingDecision,
   RouteOptions,
@@ -81,4 +81,5 @@ export type {
   ProxyFeatureFlags,
   DegradedCheckResult,
   CacheConfig,
+  CompressionConfig,
 } from "./types.js";

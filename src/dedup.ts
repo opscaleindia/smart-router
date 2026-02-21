@@ -12,6 +12,28 @@ import type { UpstreamResult } from "./router/types.js";
 /** Fields used to compute the dedup key (same as cache). */
 const KEY_FIELDS = ["model", "messages", "temperature", "tools", "tool_choice", "response_format"] as const;
 
+/** OpenClaw timestamp pattern injected into message content. */
+const TIMESTAMP_PATTERN = /^\[\w{3}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+\w+\]\s*/;
+
+/** Recursively strip OpenClaw timestamps from string values in `content` fields. */
+function stripTimestamps(obj: unknown): unknown {
+  if (Array.isArray(obj)) {
+    return obj.map(stripTimestamps);
+  }
+  if (obj !== null && typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (key === "content" && typeof value === "string") {
+        result[key] = value.replace(TIMESTAMP_PATTERN, "");
+      } else {
+        result[key] = stripTimestamps(value);
+      }
+    }
+    return result;
+  }
+  return obj;
+}
+
 interface Waiter {
   resolve: (result: UpstreamResult) => void;
   reject: (error: Error) => void;
@@ -44,7 +66,8 @@ export class RequestDedup {
         normalized[field] = body[field];
       }
     }
-    const json = JSON.stringify(normalized);
+    const stripped = stripTimestamps(normalized);
+    const json = JSON.stringify(stripped);
     return createHash("sha256").update(json).digest("hex");
   }
 
