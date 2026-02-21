@@ -2,7 +2,7 @@
 
 ## Abstract
 
-`@openclaw/smart-router` is an in-house LLM request router that sits between client applications and OpenRouter, an LLM gateway aggregating dozens of model providers. The router solves two problems: *model selection* (picking the cheapest capable model for each request) and *delivery resilience* (ensuring the request succeeds even when individual upstream providers fail). It does both with zero external dependencies — only Node.js standard library.
+`@openclaw/smart-router` is an in-house LLM request router that sits between client applications and upstream LLM providers. It integrates with OpenClaw's provider system to discover available models and auth, then routes each request to the cheapest capable model. The router solves two problems: *model selection* (picking the cheapest capable model for each request) and *delivery resilience* (ensuring the request succeeds even when individual upstream providers fail). It does both with zero external dependencies — only Node.js standard library.
 
 This document explains every feature in the system, the design rationale behind each, and why the specific implementation choices produce correct behavior under real production conditions.
 
@@ -11,17 +11,18 @@ This document explains every feature in the system, the design rationale behind 
 ## Table of Contents
 
 1. [System Overview](#1-system-overview)
-2. [Request Classification: The 15-Dimension Scorer](#2-request-classification-the-15-dimension-scorer)
-3. [Tier System and Model Selection](#3-tier-system-and-model-selection)
-4. [Routing Profiles](#4-routing-profiles)
-5. [Fallback Retry with Model Chain](#5-fallback-retry-with-model-chain)
-6. [Rate Limit Tracking](#6-rate-limit-tracking)
-7. [Degraded Response Detection](#7-degraded-response-detection)
-8. [Response Caching](#8-response-caching)
-9. [Request Deduplication](#9-request-deduplication)
-10. [Streaming Strategy](#10-streaming-strategy)
-11. [Feature Coordination in the Proxy](#11-feature-coordination-in-the-proxy)
-12. [Design Principles](#12-design-principles)
+2. [OpenClaw Integration](#2-openclaw-integration)
+3. [Request Classification: The 15-Dimension Scorer](#3-request-classification-the-15-dimension-scorer)
+4. [Tier System and Model Selection](#4-tier-system-and-model-selection)
+5. [Routing Profiles](#5-routing-profiles)
+6. [Fallback Retry with Model Chain](#6-fallback-retry-with-model-chain)
+7. [Rate Limit Tracking](#7-rate-limit-tracking)
+8. [Degraded Response Detection](#8-degraded-response-detection)
+9. [Response Caching](#9-response-caching)
+10. [Request Deduplication](#10-request-deduplication)
+11. [Streaming Strategy](#11-streaming-strategy)
+12. [Feature Coordination in the Proxy](#12-feature-coordination-in-the-proxy)
+13. [Design Principles](#13-design-principles)
 
 ---
 
@@ -34,6 +35,16 @@ Client (OpenAI SDK, curl, any HTTP client)
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Smart Router Proxy (localhost:18900)                                │
 │                                                                      │
+│  ┌────────────────┐                                                  │
+│  │ OpenClaw Config │ ← reads auth-profiles.json, auth.json,         │
+│  │ Loader          │   models.json at startup                        │
+│  └───────┬────────┘                                                  │
+│          │                                                           │
+│  ┌───────▼────────┐                                                  │
+│  │   Provider      │ ← resolves model keys to upstream targets       │
+│  │   Registry      │   (hostname, port, path, API key)               │
+│  └───────┬────────┘                                                  │
+│          │                                                           │
 │  ┌────────────┐   ┌────────────┐   ┌───────────┐   ┌─────────────┐ │
 │  │  Classifier │──▶│  Selector  │──▶│ Rate Limit│──▶│ Dedup Check │ │
 │  │ (15-dim)    │   │ (profile)  │   │ Reorder   │   │             │ │
@@ -62,18 +73,104 @@ Client (OpenAI SDK, curl, any HTTP client)
 │                                                     └─────────────┘ │
 └──────────────────────────────────────────────────────────────────────┘
   │
-  ▼
-OpenRouter (openrouter.ai/api/v1/chat/completions)
+  ▼ (Provider Registry resolves each model to its best provider)
   │
-  ▼
-Upstream Provider (OpenAI, Anthropic, Google, DeepSeek, Meta, etc.)
+  ├──▶ OpenRouter (openrouter.ai)        ← fallback for all models
+  ├──▶ OpenAI (api.openai.com)           ← direct if key configured
+  ├──▶ Google (googleapis.com)           ← direct if key configured
+  ├──▶ xAI (api.x.ai)                   ← direct if key configured
+  ├──▶ DeepSeek (api.deepseek.com)       ← direct if key configured
+  ├──▶ Anthropic (api.anthropic.com)     ← direct if key configured
+  ├──▶ Groq (api.groq.com)              ← direct if key configured
+  ├──▶ Mistral (api.mistral.ai)         ← direct if key configured
+  ├──▶ Cerebras (api.cerebras.ai)       ← direct if key configured
+  └──▶ Custom providers (from models.json)
 ```
 
 The proxy exposes an OpenAI-compatible API surface (`POST /v1/chat/completions`, `GET /v1/models`, `GET /health`). Any application that speaks the OpenAI chat completions protocol can point at Smart Router and get automatic model selection plus production resilience for free.
 
 ---
 
-## 2. Request Classification: The 15-Dimension Scorer
+## 2. OpenClaw Integration
+
+### Why integrate with OpenClaw
+
+Smart-router is designed to route only among models that OpenClaw already has configured. Rather than maintaining a separate list of API keys and provider URLs, smart-router reads OpenClaw's configuration files at startup. This means:
+
+- **Single source of truth** — add a provider key in OpenClaw, smart-router picks it up on next restart
+- **No key duplication** — API keys live in OpenClaw's auth system, not scattered in env vars
+- **Consistent model catalog** — smart-router routes to the same models OpenClaw uses
+
+### Config loader (`src/openclaw-loader.ts`)
+
+At startup, `loadOpenClawConfig()` reads three files from `~/.openclaw/agents/main/agent/`:
+
+| File | What it provides |
+|------|------------------|
+| `auth-profiles.json` | Provider API keys (e.g. `{ "openrouter:default": { provider: "openrouter", key: "sk-or-..." } }`) |
+| `auth.json` | Fallback auth format (simpler `{ provider: { key: "..." } }` structure) |
+| `models.json` | Custom provider definitions (e.g. `{ providers: { smart: { baseUrl: "...", apiKey: "..." } } }`) |
+
+The loader merges these into an `OpenClawConfig`:
+
+```typescript
+interface OpenClawConfig {
+  providerKeys: Record<string, string>;       // { openrouter: "sk-or-...", openai: "sk-..." }
+  customProviders: Record<string, { baseUrl, apiKey?, models? }>;
+  configDir: string;
+}
+```
+
+Auth-profiles takes priority over auth.json (which is only used if a provider has no entry in auth-profiles). Custom providers from models.json can override built-in provider URLs.
+
+### Provider registry (`src/providers.ts`)
+
+The `ProviderRegistry` class resolves OpenClaw model keys to concrete upstream targets. This is the bridge between the router's model IDs and actual HTTP endpoints.
+
+**Model key format:** `provider/upstream-model-id`
+
+- `openrouter/moonshotai/kimi-k2.5` → provider=`openrouter`, model=`moonshotai/kimi-k2.5`
+- `openai/gpt-5.2` → provider=`openai`, model=`gpt-5.2`
+- `google/gemini-2.5-flash` → provider=`google`, model=`gemini-2.5-flash`
+
+The first path segment is the provider name. Everything after the first `/` is the upstream model ID sent in the request body. This format matches how OpenClaw catalogs its models.
+
+**Resolution logic:**
+
+```
+resolve("openrouter/moonshotai/kimi-k2.5", passthroughAuth?)
+  → split at first "/" → provider="openrouter", model="moonshotai/kimi-k2.5"
+  → lookup base URL: openrouter → "https://openrouter.ai/api/v1"
+  → lookup API key: providerKeys["openrouter"] → "sk-or-..."
+  → build target: { hostname: "openrouter.ai", path: "/api/v1/chat/completions", ... }
+```
+
+**Auth resolution order:**
+1. Provider API key from OpenClaw config (auth-profiles.json or auth.json)
+2. Passthrough auth from client request's `Authorization` header
+3. Null (request sent without auth — will likely fail)
+
+**Direct provider routing:** When a direct provider key is available (e.g. `openai: "sk-..."`), models with that provider prefix route directly to the provider's API instead of through OpenRouter. This reduces latency and cost (no OpenRouter markup). For example, with an OpenAI key configured, `openai/gpt-5.2` routes to `api.openai.com` instead of `openrouter.ai`.
+
+### Built-in providers
+
+| Provider | Base URL | Completions Path |
+|----------|----------|-------------------|
+| openrouter | `https://openrouter.ai/api/v1` | `/chat/completions` |
+| openai | `https://api.openai.com/v1` | `/chat/completions` |
+| anthropic | `https://api.anthropic.com/v1` | `/messages` |
+| google | `https://generativelanguage.googleapis.com/v1beta/openai` | `/chat/completions` |
+| xai | `https://api.x.ai/v1` | `/chat/completions` |
+| deepseek | `https://api.deepseek.com/v1` | `/chat/completions` |
+| groq | `https://api.groq.com/openai/v1` | `/chat/completions` |
+| mistral | `https://api.mistral.ai/v1` | `/chat/completions` |
+| cerebras | `https://api.cerebras.ai/v1` | `/chat/completions` |
+
+Custom providers from `models.json` are added to this list at startup.
+
+---
+
+## 3. Request Classification: The 15-Dimension Scorer
 
 ### What it does
 
@@ -86,17 +183,17 @@ Every incoming request is scored across 15 independent dimensions to determine i
 | 1 | `reasoningMarkers` | 0.18 | Formal logic keywords: "prove", "theorem", "deduce", "contradiction" |
 | 2 | `codePresence` | 0.15 | Programming constructs: `function`, `class`, ` ````, `.map(`, `import` |
 | 3 | `multiStepPatterns` | 0.12 | Sequential instructions: "first", "then", "step 1", "followed by" |
-| 4 | `technicalTerms` | 0.12 | Infrastructure/CS vocabulary: "kubernetes", "algorithm", "distributed" |
+| 4 | `technicalTerms` | 0.10 | Infrastructure/CS vocabulary: "kubernetes", "algorithm", "distributed" |
 | 5 | `tokenCount` | 0.08 | Raw input length as a complexity proxy |
-| 6 | `agenticTask` | 0.06 | Tool-use indicators: "deploy", "debug", "git push", "edit file" |
-| 7 | `creativeMarkers` | 0.05 | Creative writing: "story", "poem", "brainstorm", "narrative" |
-| 8 | `questionComplexity` | 0.05 | Number of question marks (multi-question = more complex) |
-| 9 | `domainSpecificity` | 0.04 | Niche domains: "quantum", "CRISPR", "homomorphic", "Riemann" |
-| 10 | `constraintCount` | 0.04 | Explicit constraints: "at most", "maximum", "must", "exactly" |
-| 11 | `imperativeVerbs` | 0.03 | Action verbs: "build", "implement", "optimize", "design" |
-| 12 | `outputFormat` | 0.03 | Structured output: "JSON", "YAML", "table", "formatted as" |
-| 13 | `simpleIndicators` | 0.02 | Simplicity markers: "what is", "hello", "translate" (scores *negative*) |
-| 14 | `referenceComplexity` | 0.02 | Context references: "above", "the code", "as shown", "attached" |
+| 6 | `creativeMarkers` | 0.05 | Creative writing: "story", "poem", "brainstorm", "narrative" |
+| 7 | `questionComplexity` | 0.05 | Number of question marks (multi-question = more complex) |
+| 8 | `agenticTask` | 0.04 | Tool-use indicators: "deploy", "debug", "git push", "edit file" |
+| 9 | `constraintCount` | 0.04 | Explicit constraints: "at most", "maximum", "must", "exactly" |
+| 10 | `imperativeVerbs` | 0.03 | Action verbs: "build", "implement", "optimize", "design" |
+| 11 | `outputFormat` | 0.03 | Structured output: "JSON", "YAML", "table", "formatted as" |
+| 12 | `simpleIndicators` | 0.02 | Simplicity markers: "what is", "hello", "translate" (scores *negative*) |
+| 13 | `referenceComplexity` | 0.02 | Context references: "above", "the code", "as shown", "attached" |
+| 14 | `domainSpecificity` | 0.02 | Niche domains: "quantum", "CRISPR", "homomorphic", "Riemann" |
 | 15 | `negationComplexity` | 0.01 | Negation constraints: "don't", "avoid", "never", "must not" |
 
 ### Why it works
@@ -107,7 +204,7 @@ Every incoming request is scored across 15 independent dimensions to determine i
 
 **Each scorer returns values in [-1, 1], not just [0, 1].** Negative scores actively push toward simpler tiers. When `simpleIndicators` detects "what is" or "hello", it returns -0.4 to -1.0, directly counteracting any mild positive signals from other dimensions. This bidirectional scoring prevents the system from over-classifying simple requests that happen to contain a technical term or two.
 
-**Weights sum to exactly 1.0**, enforced by a runtime assertion at module load. This means the composite score stays in [-1, 1] and the tier boundaries have stable, interpretable meanings.
+**Weights sum to ~0.94**, validated at module load to be within [0.5, 1.5]. This keeps the composite score in a predictable range and the tier boundaries have stable, interpretable meanings.
 
 ### Confidence calibration
 
@@ -137,24 +234,24 @@ The override ordering matters: reasoning and agentic overrides can only *raise* 
 
 ---
 
-## 3. Tier System and Model Selection
+## 4. Tier System and Model Selection
 
 ### The four tiers
 
 | Tier | Score Range | Typical Requests | Model Cost Range |
 |------|-------------|-------------------|------------------|
-| **SIMPLE** | < 0.0 | "What is the capital of France?", "Hello", factual lookups | $0.10-0.40/M tokens |
-| **MEDIUM** | 0.0 to 0.3 | "Write a sorting function", "Explain OAuth", code snippets | $0.15-4.00/M tokens |
-| **COMPLEX** | 0.3 to 0.5 | Architecture design, multi-file refactoring, tool-use tasks | $2.50-15.00/M tokens |
-| **REASONING** | >= 0.5 | Mathematical proofs, formal derivations, complex multi-step logic | $0.55-40.00/M tokens |
+| **SIMPLE** | < 0.0 | "What is the capital of France?", "Hello", factual lookups | $0.00-0.50/M tokens |
+| **MEDIUM** | 0.0 to 0.3 | "Write a sorting function", "Explain OAuth", code snippets | $0.15-2.50/M tokens |
+| **COMPLEX** | 0.3 to 0.5 | Architecture design, multi-file refactoring, tool-use tasks | $2.00-15.00/M tokens |
+| **REASONING** | >= 0.5 | Mathematical proofs, formal derivations, complex multi-step logic | $0.20-75.00/M tokens |
 
 ### Why four tiers
 
 Four tiers match the natural clustering of model capabilities in the current LLM market. There's a clear quality/price jump between:
-- Flash models (Gemini Flash, GPT-4o-mini) — great at simple tasks, poor at reasoning
-- Mid-tier models (Claude Haiku, GPT-4o-mini) — reliable for moderate tasks
-- Frontier models (Claude Sonnet, GPT-4o, Gemini Pro) — strong at complex multi-step work
-- Reasoning specialists (o3, DeepSeek R1) — purpose-built for formal logic and chain-of-thought
+- Flash/free models (GPT-OSS-120B, Gemini 2.5 Flash, Kimi K2.5) — great at simple tasks, poor at formal reasoning
+- Mid-tier models (Grok Code Fast, GPT-5.2 Codex, DeepSeek V3) — reliable for moderate code and explanation tasks
+- Frontier models (Claude Sonnet 4, Gemini 3 Pro, GPT-5.2) — strong at complex multi-step work
+- Reasoning specialists (Grok 4.1 Fast, DeepSeek Reasoner, o3, o4-mini) — purpose-built for formal logic and chain-of-thought
 
 Adding more tiers would increase classification errors without adding meaningful routing discrimination. Fewer tiers would force too many requests onto expensive models.
 
@@ -170,28 +267,63 @@ The estimate is compared against a baseline cost (Claude Opus 4 at $15/$75 per m
 
 ---
 
-## 4. Routing Profiles
+## 5. Routing Profiles
 
-Four profiles let callers trade off cost vs. quality:
+Five profiles let callers trade off cost vs. quality:
 
-| Profile | Philosophy | SIMPLE Model | REASONING Model |
-|---------|-----------|--------------|-----------------|
-| **auto** | Balanced cost/quality | Gemini 2.0 Flash | DeepSeek R1 |
-| **eco** | Cheapest possible | Gemini 2.0 Flash | DeepSeek R1 |
-| **premium** | Best quality | GPT-4o Mini | OpenAI o3 |
-| **free** | Zero cost | Llama 3.3 70B (free) | Llama 3.3 70B (free) |
+### auto — balanced quality/cost (default)
 
-Each profile is a complete `Tier → { primary, fallbacks[] }` mapping. The profile is selected via the `X-Smart-Router-Profile` HTTP header, defaulting to `auto`.
+| Tier | Primary | Fallbacks |
+|------|---------|-----------|
+| SIMPLE | Kimi K2.5 | Gemini 2.5 Flash, GPT-OSS-120B, DeepSeek V3 |
+| MEDIUM | Grok Code Fast | Gemini 2.5 Flash, DeepSeek V3, Kimi K2.5 |
+| COMPLEX | Gemini 3 Pro Preview | Gemini 2.5 Flash, Gemini 2.5 Pro, DeepSeek V3, Grok 4 |
+| REASONING | Grok 4.1 Fast | DeepSeek Reasoner, o4-mini, o3 |
+
+### eco — maximum savings
+
+| Tier | Primary | Fallbacks |
+|------|---------|-----------|
+| SIMPLE | GPT-OSS-120B (free) | Gemini 2.5 Flash, DeepSeek V3 |
+| MEDIUM | Gemini 2.5 Flash | DeepSeek V3, GPT-OSS-120B |
+| COMPLEX | Gemini 2.5 Flash | DeepSeek V3, Grok 4 |
+| REASONING | Grok 4.1 Fast | DeepSeek Reasoner |
+
+### premium — best quality
+
+| Tier | Primary | Fallbacks |
+|------|---------|-----------|
+| SIMPLE | Kimi K2.5 | Claude Haiku 4.5, Gemini 2.5 Flash, Grok Code Fast |
+| MEDIUM | GPT-5.2 Codex | Kimi K2.5, Gemini 2.5 Pro, Grok 4, Claude Sonnet 4 |
+| COMPLEX | Claude Opus 4 | GPT-5.2 Codex, Claude Sonnet 4, Gemini 3 Pro, Kimi K2.5 |
+| REASONING | Claude Sonnet 4 | Claude Opus 4, o4-mini, o3, Grok 4.1 Fast |
+
+### free — zero cost
+
+All tiers use GPT-OSS-120B (free), with Gemini 2.5 Flash and DeepSeek V3 as fallbacks. The REASONING tier falls back to DeepSeek Reasoner.
+
+### agentic — optimized for tool-use / agent workflows
+
+| Tier | Primary | Fallbacks |
+|------|---------|-----------|
+| SIMPLE | Kimi K2.5 | Claude Haiku 4.5, Grok Code Fast, GPT-4o Mini |
+| MEDIUM | Grok Code Fast | Kimi K2.5, Claude Haiku 4.5, Claude Sonnet 4 |
+| COMPLEX | Claude Sonnet 4 | Claude Opus 4, GPT-5.2, Gemini 3 Pro, Grok 4 |
+| REASONING | Claude Sonnet 4 | Claude Opus 4, Grok 4.1 Fast, DeepSeek Reasoner |
 
 ### Why profiles exist
 
-Different use cases within the same application have different quality/cost requirements. An autocomplete feature needs fast, cheap responses (eco). A user-facing "explain this code" feature needs reliable quality (auto). An internal research tool can afford premium models. Profiles let one router instance serve all of these.
+Different use cases within the same application have different quality/cost requirements. An autocomplete feature needs fast, cheap responses (eco). A user-facing "explain this code" feature needs reliable quality (auto). An internal research tool can afford premium models. An agent with tool-use needs strong instruction-following (agentic). Profiles let one router instance serve all of these.
 
 The free profile exists specifically for development and testing — it routes everything through zero-cost models available on OpenRouter, letting developers iterate without incurring API charges.
 
+The agentic profile is tuned for tool-use workflows where instruction-following precision matters more than raw intelligence. Claude Sonnet 4 handles COMPLEX and REASONING because it excels at structured tool calls, even though cheaper models might handle the cognitive complexity.
+
+The profile is selected via the `X-Smart-Router-Profile` header, or by setting the model name to a profile name (e.g. `"model": "eco"`), defaulting to `auto`.
+
 ---
 
-## 5. Fallback Retry with Model Chain
+## 6. Fallback Retry with Model Chain
 
 ### What it does
 
@@ -199,11 +331,14 @@ When an upstream model returns an error, the proxy automatically retries with th
 
 ### How it works
 
-The proxy iterates the model chain sequentially. For each model, it buffers the complete response and checks the HTTP status code against a retriable set: `{429, 500, 502, 503, 504}`. If the status is retriable and there are more models to try, it moves to the next one. If the status is a non-retriable client error (400, 401, 403, 422), it returns immediately — these errors indicate a problem with the request itself, not the upstream provider, so retrying with a different model won't help.
+The proxy iterates the model chain sequentially. For each model, it resolves the upstream target via `ProviderRegistry.resolve()`, buffers the complete response, and checks the HTTP status code against a retriable set: `{429, 500, 502, 503, 504}`. If the status is retriable and there are more models to try, it moves to the next one. If the status is a non-retriable client error (400, 401, 403, 422), it returns immediately — these errors indicate a problem with the request itself, not the upstream provider, so retrying with a different model won't help.
+
+Each model in the fallback chain may resolve to a *different provider*. For example, if Gemini 2.5 Flash fails via OpenRouter, the next fallback (DeepSeek V3) might route to `api.deepseek.com` directly if a DeepSeek API key is configured. This cross-provider retry dramatically improves aggregate availability.
 
 ```
 for each model in chain:
-    result = forward(model)
+    target = providers.resolve(model)
+    result = forwardToTarget(target)
     if retriable_error and more_models:
         log and continue
     if success:
@@ -215,7 +350,7 @@ return last_result to client
 
 ### Why it works
 
-LLM API providers have independent failure modes. When OpenAI is rate-limited (429), Anthropic is usually fine. When Google has a 500, DeepSeek is usually healthy. By trying models across different providers, the system achieves much higher aggregate availability than any single provider offers.
+LLM API providers have independent failure modes. When OpenAI is rate-limited (429), xAI is usually fine. When Google has a 500, DeepSeek is usually healthy. By trying models across different providers, the system achieves much higher aggregate availability than any single provider offers.
 
 The 5-model cap prevents pathological chains from creating excessive latency. In practice, most requests succeed on the first or second attempt. The cap also bounds the total time a client might wait: at worst, 5 sequential upstream calls.
 
@@ -225,7 +360,7 @@ A 400 (bad request) or 422 (unprocessable entity) means the request itself is ma
 
 ---
 
-## 6. Rate Limit Tracking
+## 7. Rate Limit Tracking
 
 ### What it does
 
@@ -251,7 +386,7 @@ Rate limit state is held in memory, not persisted to disk. This is intentional �
 
 ---
 
-## 7. Degraded Response Detection
+## 8. Degraded Response Detection
 
 ### What it does
 
@@ -269,17 +404,26 @@ Some upstream providers return HTTP 200 with an error message in the body instea
 | `/overloaded/i` | "The server is overloaded" |
 | `/request\s+too\s+large/i` | Request size errors returned as 200 |
 | `/payload\s+too\s+large/i` | Payload size errors returned as 200 |
-| `/(.{20,}?)\1{4,}/s` | Repetitive output loops |
+| `/(.{20,}?)\1{4,}/s` | Repetitive output loops (content-only) |
 
 ### Why these specific patterns
 
-Each pattern corresponds to a real failure mode observed in production across multiple LLM providers routed through OpenRouter:
+Each pattern corresponds to a real failure mode observed in production across multiple LLM providers:
 
 **Billing/balance patterns** catch providers that return 200 with a billing error instead of 402/403. This happens because some providers' billing checks run after the initial HTTP response has been committed with a 200 status.
 
 **Rate limit/unavailable patterns** catch providers that soft-fail with a 200 containing an error message rather than returning 429/503. This is particularly common with smaller providers on the OpenRouter network.
 
-**Repetitive loop detection** (`(.{20,}?)\1{4,}`) catches a subtle but important failure mode: when a model gets stuck in a generation loop, repeating the same 20+ character block 5 or more times. This produces a technically "successful" response that is useless to the caller. The `{20,}?` minimum length prevents false positives on legitimate repetition (e.g., table borders, list markers), and `\1{4,}` (5+ total occurrences) ensures the repetition is genuinely pathological.
+**Repetitive loop detection** (`(.{20,}?)\1{4,}`) catches a subtle but important failure mode: when a model gets stuck in a generation loop, repeating the same 20+ character block 5 or more times.
+
+### Content extraction for false-positive prevention
+
+The text error patterns are checked against the raw response body (since error messages appear at the top level). However, the repetitive loop pattern uses a two-phase approach:
+
+1. **Extract content from JSON** — parse the response as OpenAI-format JSON and extract `choices[0].message.content`
+2. **Check repetition on content only** — run the repetitive loop regex against the extracted content string, not the raw JSON
+
+This prevents false positives from repeated JSON structure (e.g., multiple `choices` with similar formatting). The extracted content must also exceed 250 characters to trigger the check — short responses with legitimate repetition (e.g., "yes yes yes") are not flagged. For non-JSON responses, the raw body is checked as a fallback.
 
 ### Why only on non-streaming responses
 
@@ -287,7 +431,7 @@ Degraded detection requires the full response body to scan against patterns. For
 
 ---
 
-## 8. Response Caching
+## 9. Response Caching
 
 ### What it does
 
@@ -321,7 +465,7 @@ LLM APIs are not traditionally considered cacheable because they can produce dif
 
 ---
 
-## 9. Request Deduplication
+## 10. Request Deduplication
 
 ### What it does
 
@@ -357,7 +501,7 @@ Like degraded detection, dedup requires buffering the complete response to distr
 
 ---
 
-## 10. Streaming Strategy
+## 11. Streaming Strategy
 
 Streaming (SSE) requests follow a fundamentally different path than non-streaming requests because SSE commits the HTTP response the moment the first byte is piped to the client. The proxy handles this with a two-phase approach:
 
@@ -369,7 +513,7 @@ On the first model in the chain, the proxy inspects the upstream response status
 
 ### Fallback attempts: always buffer
 
-For second and subsequent models in the chain, the proxy always buffers responses (forcing `stream: false` in the upstream request body). This loses the streaming benefit but gains reliability — the proxy can inspect the full response before committing.
+For second and subsequent models in the chain, the proxy always buffers responses. This loses the streaming benefit but gains reliability — the proxy can inspect the full response before committing.
 
 The client receives the response as a single buffered payload rather than an SSE stream. This is an acceptable degradation: the user gets a correct response from a working model rather than an error from the primary model.
 
@@ -383,7 +527,7 @@ All three features silently deactivate for streaming requests without needing ex
 
 ---
 
-## 11. Feature Coordination in the Proxy
+## 12. Feature Coordination in the Proxy
 
 ### The `ProxyContext`
 
@@ -395,10 +539,13 @@ interface ProxyContext {
   rateLimiter: RateLimiter;
   cache: ResponseCache;
   dedup: RequestDedup;
+  providers: ProviderRegistry;
 }
 ```
 
 This design avoids module-level singletons, making testing clean: each test can create its own proxy with independent feature state. It also means multiple proxy instances in the same process (e.g., different ports with different configurations) don't share state.
+
+The `ProviderRegistry` is part of the context because it holds the loaded OpenClaw config and provider keys — these are per-proxy-instance, not global.
 
 ### Feature flags
 
@@ -435,13 +582,14 @@ The full processing pipeline for a non-streaming request:
    - hit → resolve dedup + return cached result
    - miss → proceed
 10. Fallback loop (for each model):
-    a. Forward to upstream (buffer entire response)
-    b. If 429 → record rate limit
-    c. If retriable status → log, continue to next model
-    d. If 200 → run degraded detection:
+    a. Resolve model to upstream target via ProviderRegistry
+    b. Forward to target (buffer entire response)
+    c. If 429 → record rate limit
+    d. If retriable status → log, continue to next model
+    e. If 200 → run degraded detection:
        - degraded → log, continue to next model
        - clean → cache result, resolve dedup, return to client
-    e. If non-retriable error (400, 401, etc.) → break loop
+    f. If non-retriable error (400, 401, etc.) → break loop
 11. Exhausted → resolve/reject dedup with last result, return to client
 ```
 
@@ -451,8 +599,9 @@ Every response includes routing metadata:
 
 | Header | Value |
 |--------|-------|
-| `x-smart-router-model` | The model that actually served the request |
+| `x-smart-router-model` | The model that actually served the request (OpenClaw key format) |
 | `x-smart-router-tier` | The classified tier (SIMPLE, MEDIUM, COMPLEX, REASONING) |
+| `x-smart-router-provider` | The provider that handled the request (e.g. "openrouter", "openai") |
 | `x-smart-router-attempts` | Number of upstream attempts made |
 | `x-smart-router-cache` | `"hit"` if served from cache |
 | `x-smart-router-dedup` | `"coalesced"` if served via dedup |
@@ -461,15 +610,23 @@ These headers are invaluable for debugging, monitoring, and understanding routin
 
 ---
 
-## 12. Design Principles
+## 13. Design Principles
 
 ### Zero dependencies
 
-The entire system uses only Node.js standard library (`node:http`, `node:https`, `node:crypto`, `node:assert`). No Express, no Axios, no Redis, no external caching library. This eliminates supply-chain risk, reduces binary size, simplifies deployment, and means the only thing that can break is Node.js itself.
+The entire system uses only Node.js standard library (`node:http`, `node:https`, `node:crypto`, `node:fs`, `node:path`, `node:os`, `node:assert`). No Express, no Axios, no Redis, no external caching library. This eliminates supply-chain risk, reduces binary size, simplifies deployment, and means the only thing that can break is Node.js itself.
+
+### OpenClaw-native
+
+Smart-router is designed as a component of the OpenClaw ecosystem, not a standalone product. It reads provider auth from OpenClaw's config files, uses OpenClaw's model key format (`provider/model-id`), and registers itself as an OpenClaw provider so agents can use it transparently. This tight integration eliminates configuration drift between the router and the broader system.
 
 ### Sub-millisecond classification
 
 The classifier runs in <1ms for any prompt length. This is essential because the classification runs *in the request path* — every millisecond of latency here adds to the end-to-end response time. Keyword counting against in-memory arrays is orders of magnitude faster than embedding-based classification or calling another model.
+
+### Multi-provider resilience
+
+Each model in the fallback chain can resolve to a different upstream provider. A single request might try OpenRouter, then fall back to a direct OpenAI call, then to Google's API. This cross-provider retry is fundamentally more resilient than retrying within a single provider, because provider outages are typically independent.
 
 ### Graceful degradation everywhere
 
@@ -480,6 +637,7 @@ Every feature is designed to degrade gracefully rather than fail hard:
 - Dedup expiry returns an error to waiters (doesn't hang forever)
 - All features can be independently disabled via flags
 - The last model in the chain always gets its response returned to the client, even if degraded — a degraded response is better than no response
+- If OpenClaw config can't be read, the loader silently returns empty config (the system still works with passthrough auth)
 
 ### Stateless across restarts
 
@@ -498,14 +656,18 @@ The proxy speaks the exact OpenAI chat completions protocol. This means any appl
 
 ## Appendix: Model Registry
 
-The system includes 17 models across 5 providers:
+The system includes 19 models across 7 providers, all using OpenClaw key format:
 
 | Provider | Models | Tier Coverage |
 |----------|--------|---------------|
-| Google | Gemini 2.0 Flash, 2.5 Flash, 2.5 Pro | SIMPLE through COMPLEX |
-| OpenAI | GPT-4o Mini, GPT-4o, o3, o3-mini | MEDIUM through REASONING |
-| Anthropic | Claude 3.5 Haiku, Sonnet 4, Sonnet 4.6, Opus 4 | MEDIUM through baseline |
-| DeepSeek | V3, R1 | SIMPLE and REASONING |
-| Meta/Others | Llama 3.3 70B, Qwen3, Step 3.5 Flash, Trinity | Free tier |
+| Moonshot (via OpenRouter) | Kimi K2.5 | SIMPLE primary (auto, premium, agentic) |
+| xAI (via OpenRouter) | Grok Code Fast, Grok 4.1 Fast, Grok 4 | MEDIUM primary (auto, agentic), REASONING primary (auto, eco) |
+| Google (via OpenRouter) | Gemini 3 Pro Preview, Gemini 2.5 Pro, Gemini 2.5 Flash | COMPLEX primary (auto), widespread fallback |
+| OpenAI (via OpenRouter) | GPT-5.2, GPT-5.2 Codex, GPT-4o, GPT-4o Mini, o3, o4-mini | MEDIUM primary (premium), REASONING fallback |
+| Anthropic (via OpenRouter) | Claude Haiku 4.5, Claude Sonnet 4, Claude Opus 4 | COMPLEX primary (premium), REASONING primary (premium, agentic), baseline |
+| DeepSeek (via OpenRouter) | DeepSeek V3 Chat, DeepSeek Reasoner | Widespread fallback, REASONING fallback |
+| NVIDIA/Free (via OpenRouter) | GPT-OSS-120B (free) | SIMPLE primary (eco, free), all tiers (free profile) |
 
-All models are verified to support tool/function calling on OpenRouter, ensuring consistent capability across the fallback chain.
+**Baseline model:** Claude Opus 4 ($15/$75 per M tokens) — used as the reference point for savings percentage calculations.
+
+All models are verified to be available on OpenRouter, ensuring consistent routing even when direct provider keys are not configured. When a direct provider key is available, the corresponding models route directly to that provider's API for lower latency and cost.
