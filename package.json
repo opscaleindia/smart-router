@@ -1,0 +1,28 @@
+{
+  "name": "@openclaw/smart-router",
+  "version": "0.1.0",
+  "description": "In-house LLM smart router for OpenClaw — classifies prompt complexity and routes to optimal models via OpenRouter",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx tests/router.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "license": "MIT"
+}
