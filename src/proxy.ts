@@ -2,12 +2,14 @@
  * Smart Router Local Proxy Server
  *
  * OpenAI-compatible HTTP proxy that classifies prompts and routes
- * to optimal OpenRouter models. Features: fallback retry, rate limit
- * tracking, degraded response detection, request dedup, response cache.
+ * to optimal models via provider-based routing. Each model is resolved
+ * to its best available provider (direct API or OpenRouter fallback).
+ *
+ * Features: provider routing, fallback retry, rate limit tracking,
+ * degraded response detection, request dedup, response cache.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { request as httpsRequest } from "node:https";
 import { route, MODEL_REGISTRY } from "./index.js";
 import type { RoutingProfile, UpstreamResult, ProxyFeatureFlags, CacheConfig } from "./router/types.js";
 import { DEFAULT_PROXY_FEATURES, DEFAULT_CACHE_CONFIG } from "./router/types.js";
@@ -15,9 +17,13 @@ import { RateLimiter } from "./rate-limiter.js";
 import { checkDegraded } from "./degraded-detector.js";
 import { ResponseCache } from "./cache.js";
 import { RequestDedup } from "./dedup.js";
+import {
+  ProviderRegistry,
+  forwardToTarget,
+  forwardStreamingToTarget,
+} from "./providers.js";
+import { loadOpenClawConfig, type OpenClawConfig } from "./openclaw-loader.js";
 
-const OPENROUTER_HOST = "openrouter.ai";
-const OPENROUTER_PATH = "/api/v1/chat/completions";
 const MAX_FALLBACK_CHAIN = 5;
 
 /** Retriable HTTP status codes. */
@@ -100,137 +106,6 @@ function isRetriableStatus(status: number): boolean {
   return RETRIABLE_STATUSES.has(status);
 }
 
-// ---------------------------------------------------------------------------
-// Upstream forwarding (Promise-based, always buffers)
-// ---------------------------------------------------------------------------
-
-/** Forward a request to upstream and buffer the entire response. */
-function forwardToUpstream(
-  model: string,
-  requestBody: Record<string, unknown>,
-  authHeader: string,
-  passHeaders: Record<string, string>,
-  attemptIndex: number,
-): Promise<UpstreamResult> {
-  return new Promise((resolve, reject) => {
-    const bodyWithModel = { ...requestBody, model, stream: false };
-    const payload = JSON.stringify(bodyWithModel);
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "Content-Length": String(Buffer.byteLength(payload)),
-      Authorization: authHeader,
-      ...passHeaders,
-    };
-
-    const req = httpsRequest(
-      {
-        hostname: OPENROUTER_HOST,
-        port: 443,
-        path: OPENROUTER_PATH,
-        method: "POST",
-        headers,
-      },
-      (upstreamRes) => {
-        const chunks: Buffer[] = [];
-        upstreamRes.on("data", (chunk: Buffer) => chunks.push(chunk));
-        upstreamRes.on("end", () => {
-          const responseHeaders: Record<string, string | string[] | undefined> = {};
-          for (const [key, value] of Object.entries(upstreamRes.headers)) {
-            responseHeaders[key] = value;
-          }
-          resolve({
-            status: upstreamRes.statusCode ?? 502,
-            headers: responseHeaders,
-            body: Buffer.concat(chunks),
-            model,
-            attemptIndex,
-          });
-        });
-        upstreamRes.on("error", (err) => reject(err));
-      },
-    );
-
-    req.on("error", (err) => reject(err));
-    req.write(payload);
-    req.end();
-  });
-}
-
-/** Forward a streaming request to upstream. Pipes SSE directly on 2xx. */
-function forwardStreamingToUpstream(
-  model: string,
-  requestBody: Record<string, unknown>,
-  authHeader: string,
-  passHeaders: Record<string, string>,
-  res: ServerResponse,
-  routingHeaders: Record<string, string>,
-): Promise<{ piped: boolean; result?: UpstreamResult }> {
-  return new Promise((resolve, reject) => {
-    const bodyWithModel = { ...requestBody, model, stream: true };
-    const payload = JSON.stringify(bodyWithModel);
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "Content-Length": String(Buffer.byteLength(payload)),
-      Authorization: authHeader,
-      ...passHeaders,
-    };
-
-    const req = httpsRequest(
-      {
-        hostname: OPENROUTER_HOST,
-        port: 443,
-        path: OPENROUTER_PATH,
-        method: "POST",
-        headers,
-      },
-      (upstreamRes) => {
-        const status = upstreamRes.statusCode ?? 502;
-
-        if (status >= 200 && status < 300) {
-          // 2xx: pipe SSE directly to client (committed, no more fallback)
-          const responseHeaders: Record<string, string | string[]> = {};
-          for (const [key, value] of Object.entries(upstreamRes.headers)) {
-            if (value !== undefined) {
-              responseHeaders[key] = value as string | string[];
-            }
-          }
-          Object.assign(responseHeaders, routingHeaders);
-          res.writeHead(status, responseHeaders);
-          upstreamRes.pipe(res);
-          resolve({ piped: true });
-        } else {
-          // Error: buffer and return for fallback
-          const chunks: Buffer[] = [];
-          upstreamRes.on("data", (chunk: Buffer) => chunks.push(chunk));
-          upstreamRes.on("end", () => {
-            const responseHeaders: Record<string, string | string[] | undefined> = {};
-            for (const [key, value] of Object.entries(upstreamRes.headers)) {
-              responseHeaders[key] = value;
-            }
-            resolve({
-              piped: false,
-              result: {
-                status,
-                headers: responseHeaders,
-                body: Buffer.concat(chunks),
-                model,
-                attemptIndex: 0,
-              },
-            });
-          });
-          upstreamRes.on("error", (err) => reject(err));
-        }
-      },
-    );
-
-    req.on("error", (err) => reject(err));
-    req.write(payload);
-    req.end();
-  });
-}
-
 /** Write a buffered UpstreamResult to the client response. */
 function writeUpstreamResult(
   res: ServerResponse,
@@ -266,8 +141,15 @@ function handleModels(_req: IncomingMessage, res: ServerResponse): void {
 // /health
 // ---------------------------------------------------------------------------
 
-function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
-  sendJSON(res, 200, { status: "ok" });
+function handleHealth(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: ProxyContext,
+): void {
+  sendJSON(res, 200, {
+    status: "ok",
+    providers: ctx.providers.status(),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +161,7 @@ interface ProxyContext {
   rateLimiter: RateLimiter;
   cache: ResponseCache;
   dedup: RequestDedup;
+  providers: ProviderRegistry;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +197,7 @@ async function handleChatCompletions(
 
   // Determine profile: header > model name > default "auto"
   const profileHeader = req.headers["x-smart-router-profile"];
-  const VALID_PROFILES = ["auto", "eco", "premium", "free"] as const;
+  const VALID_PROFILES = ["auto", "eco", "premium", "free", "agentic"] as const;
   let profile: RoutingProfile = "auto";
   if (typeof profileHeader === "string" && VALID_PROFILES.includes(profileHeader as any)) {
     profile = profileHeader as RoutingProfile;
@@ -326,19 +209,13 @@ async function handleChatCompletions(
   // Route the request
   const decision = route(userMessage, systemPrompt, maxTokens, { profile });
 
-  log(
-    `${decision.tier} ${decision.model} (score=${decision.scoring.score.toFixed(3)}, savings=${decision.cost.savingsPercent}%)`,
-  );
-
-  // Get authorization header
+  // Get authorization header (used as passthrough for OpenRouter)
   const authHeader = req.headers["authorization"];
-  if (!authHeader) {
-    sendError(res, 401, "Missing Authorization header");
-    return;
-  }
-  const auth = typeof authHeader === "string" ? authHeader : authHeader[0];
+  const passthroughAuth = typeof authHeader === "string"
+    ? authHeader
+    : Array.isArray(authHeader) ? authHeader[0] : undefined;
 
-  // Collect pass-through headers
+  // Collect pass-through headers (for OpenRouter)
   const passHeaders: Record<string, string> = {};
   const referer = req.headers["http-referer"] ?? req.headers["referer"];
   if (referer) passHeaders["HTTP-Referer"] = String(referer);
@@ -355,6 +232,12 @@ async function handleChatCompletions(
     modelChain = ctx.rateLimiter.prioritizeNonRateLimited(modelChain);
   }
 
+  // Resolve the primary model's provider for logging
+  const primaryTarget = ctx.providers.resolve(decision.model, passthroughAuth);
+  log(
+    `${decision.tier} ${decision.model} → ${primaryTarget.provider}/${primaryTarget.upstreamModelId} (score=${decision.scoring.score.toFixed(3)}, savings=${decision.cost.savingsPercent}%)`,
+  );
+
   const routingHeaders: Record<string, string> = {
     "x-smart-router-model": decision.model,
     "x-smart-router-tier": decision.tier,
@@ -365,52 +248,51 @@ async function handleChatCompletions(
   // ---------------------------------------------------------------------------
   if (isStreaming) {
     if (ctx.features.fallbackRetry) {
-      // Try models in order; first 2xx gets piped directly
       for (let i = 0; i < modelChain.length; i++) {
         const model = modelChain[i];
+        const target = ctx.providers.resolve(model, passthroughAuth);
         routingHeaders["x-smart-router-model"] = model;
+        routingHeaders["x-smart-router-provider"] = target.provider;
         routingHeaders["x-smart-router-attempts"] = String(i + 1);
 
         try {
-          const outcome = await forwardStreamingToUpstream(
-            model, body, auth, passHeaders, res, routingHeaders,
+          const outcome = await forwardStreamingToTarget(
+            target, body, passHeaders, res, routingHeaders,
           );
 
           if (outcome.piped) {
-            // SSE is flowing to client — done
             return;
           }
 
-          // Error status — check if retriable
           const result = outcome.result!;
           if (result.status === 429 && ctx.features.rateLimitTracking) {
             ctx.rateLimiter.recordRateLimit(model);
           }
           if (!isRetriableStatus(result.status) || i === modelChain.length - 1) {
-            // Not retriable or last attempt — send error to client
             writeUpstreamResult(res, result, routingHeaders);
             return;
           }
-          log(`Streaming attempt ${i + 1} failed (${result.status}) for ${model}, trying next`);
+          log(`Streaming attempt ${i + 1} failed (${result.status}) for ${model} via ${target.provider}, trying next`);
         } catch (err: any) {
           if (i === modelChain.length - 1) {
-            sendError(res, 502, `Failed to connect to OpenRouter: ${err.message}`);
+            sendError(res, 502, `Failed to connect to ${target.provider}: ${err.message}`);
             return;
           }
-          log(`Streaming attempt ${i + 1} error for ${model}: ${err.message}, trying next`);
+          log(`Streaming attempt ${i + 1} error for ${model} via ${target.provider}: ${err.message}, trying next`);
         }
       }
     } else {
-      // No fallback: single streaming attempt
+      const target = ctx.providers.resolve(modelChain[0], passthroughAuth);
+      routingHeaders["x-smart-router-provider"] = target.provider;
       try {
-        const outcome = await forwardStreamingToUpstream(
-          modelChain[0], body, auth, passHeaders, res, routingHeaders,
+        const outcome = await forwardStreamingToTarget(
+          target, body, passHeaders, res, routingHeaders,
         );
         if (!outcome.piped && outcome.result) {
           writeUpstreamResult(res, outcome.result, routingHeaders);
         }
       } catch (err: any) {
-        sendError(res, 502, `Failed to connect to OpenRouter: ${err.message}`);
+        sendError(res, 502, `Failed to connect to ${target.provider}: ${err.message}`);
       }
     }
     return;
@@ -457,11 +339,13 @@ async function handleChatCompletions(
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i];
+    const target = ctx.providers.resolve(model, passthroughAuth);
     routingHeaders["x-smart-router-model"] = model;
+    routingHeaders["x-smart-router-provider"] = target.provider;
     routingHeaders["x-smart-router-attempts"] = String(i + 1);
 
     try {
-      const result = await forwardToUpstream(model, body, auth, passHeaders, i);
+      const result = await forwardToTarget(target, body, passHeaders, i);
       lastResult = result;
 
       // Record rate limits
@@ -472,21 +356,19 @@ async function handleChatCompletions(
       // Check if retriable error
       if (isRetriableStatus(result.status)) {
         if (i < modelsToTry.length - 1) {
-          log(`Attempt ${i + 1} failed (${result.status}) for ${model}, trying next`);
+          log(`Attempt ${i + 1} failed (${result.status}) for ${model} via ${target.provider}, trying next`);
           continue;
         }
-        // Last attempt — fall through to write result
       } else if (result.status >= 200 && result.status < 300) {
         // Degraded detection on 200 responses
         if (ctx.features.degradedDetection) {
           const bodyStr = result.body.toString("utf-8");
           const degraded = checkDegraded(bodyStr);
           if (degraded.isDegraded) {
-            log(`Degraded response from ${model}: ${degraded.matchedPattern}`);
+            log(`Degraded response from ${model} via ${target.provider}: ${degraded.matchedPattern}`);
             if (i < modelsToTry.length - 1) {
               continue;
             }
-            // Last attempt — send degraded response anyway
           }
         }
 
@@ -505,10 +387,10 @@ async function handleChatCompletions(
         break;
       }
     } catch (err: any) {
-      log(`Attempt ${i + 1} error for ${model}: ${err.message}`);
+      log(`Attempt ${i + 1} error for ${model} via ${target.provider}: ${err.message}`);
       if (i === modelsToTry.length - 1) {
         if (dedupKey) ctx.dedup.reject(dedupKey, err);
-        sendError(res, 502, `Failed to connect to OpenRouter: ${err.message}`);
+        sendError(res, 502, `Failed to connect to upstream: ${err.message}`);
         return;
       }
     }
@@ -549,7 +431,7 @@ function createRequestHandler(ctx: ProxyContext) {
     res.setHeader("Access-Control-Allow-Origin", "*");
 
     if (method === "GET" && url === "/health") {
-      handleHealth(req, res);
+      handleHealth(req, res, ctx);
     } else if (method === "GET" && url === "/v1/models") {
       handleModels(req, res);
     } else if (method === "POST" && url === "/v1/chat/completions") {
@@ -575,6 +457,8 @@ export interface ProxyServerOptions {
   cacheConfig?: Partial<CacheConfig>;
   rateLimitCooldownMs?: number;
   dedupTtlMs?: number;
+  /** Pre-loaded OpenClaw config (if omitted, reads from disk). */
+  openclawConfig?: OpenClawConfig;
 }
 
 export function createProxyServer(options: ProxyServerOptions = {}) {
@@ -585,11 +469,15 @@ export function createProxyServer(options: ProxyServerOptions = {}) {
     ...options.features,
   };
 
+  const openclawConfig = options.openclawConfig ?? loadOpenClawConfig();
+  const providers = new ProviderRegistry(openclawConfig);
+
   const ctx: ProxyContext = {
     features,
     rateLimiter: new RateLimiter(options.rateLimitCooldownMs),
     cache: new ResponseCache(options.cacheConfig),
     dedup: new RequestDedup(options.dedupTtlMs),
+    providers,
   };
 
   const server = createServer(createRequestHandler(ctx));

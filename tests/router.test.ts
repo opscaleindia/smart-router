@@ -124,7 +124,7 @@ console.log("\n--- Full route() tests ---\n");
 {
   const decision = route("Hello", "", 4096, { profile: "free" });
   assert.strictEqual(decision.profile, "free");
-  assert.ok(decision.model.includes(":free"), "Free profile should use free models");
+  assert.strictEqual(decision.model, "openrouter/openai/gpt-oss-120b:free", "Free profile should use GPT-OSS-120B free");
   console.log(`✅ route("Hello", free) → ${decision.model} (${decision.tier})`);
 }
 

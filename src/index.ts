@@ -3,7 +3,7 @@
  *
  * In-house LLM smart router for OpenClaw.
  * Classifies prompt complexity using a 14-dimension weighted scorer
- * and routes to optimal models via OpenRouter.
+ * and routes to optimal models via provider-based routing.
  *
  * Usage:
  *   import { route, Tier } from '@openclaw/smart-router';
@@ -55,3 +55,11 @@ export { ResponseCache } from "./cache.js";
 export { RequestDedup } from "./dedup.js";
 export { createProxyServer } from "./proxy.js";
 export type { ProxyServerOptions } from "./proxy.js";
+
+// Provider routing
+export { ProviderRegistry, forwardToTarget, forwardStreamingToTarget } from "./providers.js";
+export type { ResolvedTarget } from "./providers.js";
+
+// OpenClaw config integration
+export { loadOpenClawConfig, OPENCLAW_BUILTIN_PROVIDERS } from "./openclaw-loader.js";
+export type { OpenClawConfig, OpenClawAuthProfile, OpenClawCustomProvider } from "./openclaw-loader.js";

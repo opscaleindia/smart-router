@@ -1,11 +1,12 @@
 /**
  * Tier → Model Mapping Configuration
  *
- * Defines 4 routing profiles (auto, eco, premium, free), each mapping
- * the 4 tiers to OpenRouter model IDs with fallback chains.
- * Also contains the default scoring config and model pricing registry.
+ * Defines 5 routing profiles (auto, eco, premium, free, agentic), each mapping
+ * the 4 tiers to model IDs with fallback chains.
  *
- * IMPORTANT: All models MUST support tool/function calling on OpenRouter.
+ * IMPORTANT: Model IDs use OpenClaw key format: "provider/model-id"
+ * (e.g. "openrouter/moonshotai/kimi-k2.5"). This ensures smart-router
+ * only routes among models configured in OpenClaw.
  */
 
 import {
@@ -33,118 +34,141 @@ export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
 };
 
 // ---------------------------------------------------------------------------
-// Model registry — OpenRouter model IDs with pricing
-// All models verified to support tool/function calling.
+// Model registry — OpenClaw key format (provider/model-id)
 // ---------------------------------------------------------------------------
 
 export const MODEL_REGISTRY: Record<string, ModelInfo> = {
-  // --- Cheap / Simple tier models ---
-  "google/gemini-2.0-flash-001": {
-    id: "google/gemini-2.0-flash-001",
-    name: "Gemini 2.0 Flash",
-    inputPrice: 0.10,
-    outputPrice: 0.40,
-    contextWindow: 1048576,
+  // --- Moonshot / Kimi (via OpenRouter) ---
+  "openrouter/moonshotai/kimi-k2.5": {
+    id: "openrouter/moonshotai/kimi-k2.5",
+    name: "Kimi K2.5",
+    inputPrice: 0.50,
+    outputPrice: 2.40,
+    contextWindow: 262144,
     maxOutput: 8192,
   },
-  "google/gemini-2.5-flash": {
-    id: "google/gemini-2.5-flash",
+
+  // --- xAI / Grok (via OpenRouter) ---
+  "openrouter/x-ai/grok-code-fast-1": {
+    id: "openrouter/x-ai/grok-code-fast-1",
+    name: "Grok Code Fast",
+    inputPrice: 0.20,
+    outputPrice: 1.50,
+    contextWindow: 131072,
+    maxOutput: 16384,
+  },
+  "openrouter/x-ai/grok-4-1-fast": {
+    id: "openrouter/x-ai/grok-4-1-fast",
+    name: "Grok 4.1 Fast",
+    inputPrice: 0.20,
+    outputPrice: 0.50,
+    contextWindow: 131072,
+    maxOutput: 16384,
+  },
+  "openrouter/x-ai/grok-4-0709": {
+    id: "openrouter/x-ai/grok-4-0709",
+    name: "Grok 4 (0709)",
+    inputPrice: 0.20,
+    outputPrice: 1.50,
+    contextWindow: 131072,
+    maxOutput: 16384,
+  },
+
+  // --- Google (via OpenRouter) ---
+  "openrouter/google/gemini-3-pro-preview": {
+    id: "openrouter/google/gemini-3-pro-preview",
+    name: "Gemini 3 Pro Preview",
+    inputPrice: 2.00,
+    outputPrice: 12.00,
+    contextWindow: 1050000,
+    maxOutput: 65536,
+  },
+  "openrouter/google/gemini-2.5-pro": {
+    id: "openrouter/google/gemini-2.5-pro",
+    name: "Gemini 2.5 Pro",
+    inputPrice: 1.25,
+    outputPrice: 10.00,
+    contextWindow: 1050000,
+    maxOutput: 65536,
+  },
+  "openrouter/google/gemini-2.5-flash": {
+    id: "openrouter/google/gemini-2.5-flash",
     name: "Gemini 2.5 Flash",
     inputPrice: 0.15,
     outputPrice: 0.60,
-    contextWindow: 1048576,
+    contextWindow: 1000000,
     maxOutput: 65536,
   },
-  "deepseek/deepseek-chat-v3-0324": {
-    id: "deepseek/deepseek-chat-v3-0324",
-    name: "DeepSeek V3 0324",
-    inputPrice: 0.27,
-    outputPrice: 1.10,
-    contextWindow: 64000,
-    maxOutput: 8192,
-  },
 
-  // --- Mid-tier / Medium models ---
-  "openai/gpt-4o-mini": {
-    id: "openai/gpt-4o-mini",
-    name: "GPT-4o Mini",
-    inputPrice: 0.15,
-    outputPrice: 0.60,
+  // --- OpenAI (via OpenRouter) ---
+  "openrouter/openai/gpt-5.2": {
+    id: "openrouter/openai/gpt-5.2",
+    name: "GPT-5.2",
+    inputPrice: 1.75,
+    outputPrice: 14.00,
+    contextWindow: 400000,
+    maxOutput: 128000,
+  },
+  "openrouter/openai/gpt-5.2-codex": {
+    id: "openrouter/openai/gpt-5.2-codex",
+    name: "GPT-5.2 Codex",
+    inputPrice: 2.50,
+    outputPrice: 12.00,
     contextWindow: 128000,
-    maxOutput: 16384,
+    maxOutput: 32000,
   },
-  "anthropic/claude-3.5-haiku": {
-    id: "anthropic/claude-3.5-haiku",
-    name: "Claude 3.5 Haiku",
-    inputPrice: 0.80,
-    outputPrice: 4.00,
-    contextWindow: 200000,
-    maxOutput: 8192,
-  },
-
-  // --- Premium / Complex tier models ---
-  "openai/gpt-4o": {
-    id: "openai/gpt-4o",
+  "openrouter/openai/gpt-4o": {
+    id: "openrouter/openai/gpt-4o",
     name: "GPT-4o",
     inputPrice: 2.50,
     outputPrice: 10.00,
     contextWindow: 128000,
     maxOutput: 16384,
   },
-  "anthropic/claude-sonnet-4": {
-    id: "anthropic/claude-sonnet-4",
+  "openrouter/openai/gpt-4o-mini": {
+    id: "openrouter/openai/gpt-4o-mini",
+    name: "GPT-4o Mini",
+    inputPrice: 0.15,
+    outputPrice: 0.60,
+    contextWindow: 128000,
+    maxOutput: 16384,
+  },
+  "openrouter/openai/o3": {
+    id: "openrouter/openai/o3",
+    name: "o3",
+    inputPrice: 2.00,
+    outputPrice: 8.00,
+    contextWindow: 200000,
+    maxOutput: 100000,
+  },
+  "openrouter/openai/o4-mini": {
+    id: "openrouter/openai/o4-mini",
+    name: "o4-mini",
+    inputPrice: 1.10,
+    outputPrice: 4.40,
+    contextWindow: 128000,
+    maxOutput: 65536,
+  },
+
+  // --- Anthropic (via OpenRouter) ---
+  "openrouter/anthropic/claude-haiku-4.5": {
+    id: "openrouter/anthropic/claude-haiku-4.5",
+    name: "Claude Haiku 4.5",
+    inputPrice: 1.00,
+    outputPrice: 5.00,
+    contextWindow: 200000,
+    maxOutput: 8192,
+  },
+  "openrouter/anthropic/claude-sonnet-4": {
+    id: "openrouter/anthropic/claude-sonnet-4",
     name: "Claude Sonnet 4",
     inputPrice: 3.00,
     outputPrice: 15.00,
     contextWindow: 200000,
-    maxOutput: 8192,
+    maxOutput: 64000,
   },
-  "google/gemini-2.5-pro": {
-    id: "google/gemini-2.5-pro",
-    name: "Gemini 2.5 Pro",
-    inputPrice: 2.50,
-    outputPrice: 15.00,
-    contextWindow: 1048576,
-    maxOutput: 65536,
-  },
-  "anthropic/claude-sonnet-4-6": {
-    id: "anthropic/claude-sonnet-4-6",
-    name: "Claude Sonnet 4.6",
-    inputPrice: 3.00,
-    outputPrice: 15.00,
-    contextWindow: 200000,
-    maxOutput: 16384,
-  },
-
-  // --- Reasoning tier models ---
-  "openai/o3": {
-    id: "openai/o3",
-    name: "OpenAI o3",
-    inputPrice: 10.00,
-    outputPrice: 40.00,
-    contextWindow: 200000,
-    maxOutput: 100000,
-  },
-  "deepseek/deepseek-r1-0528": {
-    id: "deepseek/deepseek-r1-0528",
-    name: "DeepSeek R1 0528",
-    inputPrice: 0.55,
-    outputPrice: 2.19,
-    contextWindow: 64000,
-    maxOutput: 8192,
-  },
-  "openai/o3-mini": {
-    id: "openai/o3-mini",
-    name: "OpenAI o3-mini",
-    inputPrice: 1.10,
-    outputPrice: 4.40,
-    contextWindow: 200000,
-    maxOutput: 100000,
-  },
-
-  // --- Baseline (for savings comparison) ---
-  "anthropic/claude-opus-4": {
-    id: "anthropic/claude-opus-4",
+  "openrouter/anthropic/claude-opus-4": {
+    id: "openrouter/anthropic/claude-opus-4",
     name: "Claude Opus 4",
     inputPrice: 15.00,
     outputPrice: 75.00,
@@ -152,38 +176,32 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     maxOutput: 32000,
   },
 
-  // --- Free tier models (all with tool calling support) ---
-  "meta-llama/llama-3.3-70b-instruct:free": {
-    id: "meta-llama/llama-3.3-70b-instruct:free",
-    name: "Llama 3.3 70B (Free)",
-    inputPrice: 0,
-    outputPrice: 0,
-    contextWindow: 131072,
-    maxOutput: 4096,
+  // --- DeepSeek (via OpenRouter) ---
+  "openrouter/deepseek/deepseek-chat": {
+    id: "openrouter/deepseek/deepseek-chat",
+    name: "DeepSeek V3 Chat",
+    inputPrice: 0.28,
+    outputPrice: 0.42,
+    contextWindow: 128000,
+    maxOutput: 8192,
   },
-  "qwen/qwen3-4b:free": {
-    id: "qwen/qwen3-4b:free",
-    name: "Qwen3 4B (Free)",
-    inputPrice: 0,
-    outputPrice: 0,
-    contextWindow: 32768,
-    maxOutput: 4096,
+  "openrouter/deepseek/deepseek-reasoner": {
+    id: "openrouter/deepseek/deepseek-reasoner",
+    name: "DeepSeek Reasoner",
+    inputPrice: 0.28,
+    outputPrice: 0.42,
+    contextWindow: 128000,
+    maxOutput: 8192,
   },
-  "stepfun/step-3.5-flash:free": {
-    id: "stepfun/step-3.5-flash:free",
-    name: "Step 3.5 Flash (Free)",
+
+  // --- NVIDIA / Free (via OpenRouter) ---
+  "openrouter/openai/gpt-oss-120b:free": {
+    id: "openrouter/openai/gpt-oss-120b:free",
+    name: "GPT-OSS 120B (Free)",
     inputPrice: 0,
     outputPrice: 0,
-    contextWindow: 32768,
-    maxOutput: 4096,
-  },
-  "arcee-ai/trinity-large-preview:free": {
-    id: "arcee-ai/trinity-large-preview:free",
-    name: "Trinity Large Preview (Free)",
-    inputPrice: 0,
-    outputPrice: 0,
-    contextWindow: 32768,
-    maxOutput: 4096,
+    contextWindow: 128000,
+    maxOutput: 16384,
   },
 };
 
@@ -193,127 +211,170 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
 
 const AUTO_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
-    primary: "google/gemini-2.0-flash-001",
+    primary: "openrouter/moonshotai/kimi-k2.5",
     fallbacks: [
-      "google/gemini-2.5-flash",
-      "deepseek/deepseek-chat-v3-0324",
-      "openai/gpt-4o-mini",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/openai/gpt-oss-120b:free",
+      "openrouter/deepseek/deepseek-chat",
     ],
   },
   [Tier.MEDIUM]: {
-    primary: "openai/gpt-4o-mini",
+    primary: "openrouter/x-ai/grok-code-fast-1",
     fallbacks: [
-      "google/gemini-2.5-flash",
-      "anthropic/claude-3.5-haiku",
-      "deepseek/deepseek-chat-v3-0324",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/deepseek/deepseek-chat",
+      "openrouter/moonshotai/kimi-k2.5",
     ],
   },
   [Tier.COMPLEX]: {
-    primary: "google/gemini-2.5-pro",
+    primary: "openrouter/google/gemini-3-pro-preview",
     fallbacks: [
-      "anthropic/claude-sonnet-4",
-      "openai/gpt-4o",
-      "anthropic/claude-sonnet-4-6",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/google/gemini-2.5-pro",
+      "openrouter/deepseek/deepseek-chat",
+      "openrouter/x-ai/grok-4-0709",
     ],
   },
   [Tier.REASONING]: {
-    primary: "deepseek/deepseek-r1-0528",
+    primary: "openrouter/x-ai/grok-4-1-fast",
     fallbacks: [
-      "openai/o3-mini",
-      "openai/o3",
+      "openrouter/deepseek/deepseek-reasoner",
+      "openrouter/openai/o4-mini",
+      "openrouter/openai/o3",
     ],
   },
 };
 
 const ECO_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
-    primary: "google/gemini-2.0-flash-001",
+    primary: "openrouter/openai/gpt-oss-120b:free",
     fallbacks: [
-      "deepseek/deepseek-chat-v3-0324",
-      "google/gemini-2.5-flash",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/deepseek/deepseek-chat",
     ],
   },
   [Tier.MEDIUM]: {
-    primary: "deepseek/deepseek-chat-v3-0324",
+    primary: "openrouter/google/gemini-2.5-flash",
     fallbacks: [
-      "google/gemini-2.5-flash",
-      "openai/gpt-4o-mini",
+      "openrouter/deepseek/deepseek-chat",
+      "openrouter/openai/gpt-oss-120b:free",
     ],
   },
   [Tier.COMPLEX]: {
-    primary: "google/gemini-2.5-flash",
+    primary: "openrouter/google/gemini-2.5-flash",
     fallbacks: [
-      "deepseek/deepseek-chat-v3-0324",
-      "openai/gpt-4o-mini",
+      "openrouter/deepseek/deepseek-chat",
+      "openrouter/x-ai/grok-4-0709",
     ],
   },
   [Tier.REASONING]: {
-    primary: "deepseek/deepseek-r1-0528",
+    primary: "openrouter/x-ai/grok-4-1-fast",
     fallbacks: [
-      "openai/o3-mini",
+      "openrouter/deepseek/deepseek-reasoner",
     ],
   },
 };
 
 const PREMIUM_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
-    primary: "openai/gpt-4o-mini",
+    primary: "openrouter/moonshotai/kimi-k2.5",
     fallbacks: [
-      "anthropic/claude-3.5-haiku",
-      "google/gemini-2.5-flash",
+      "openrouter/anthropic/claude-haiku-4.5",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/x-ai/grok-code-fast-1",
     ],
   },
   [Tier.MEDIUM]: {
-    primary: "anthropic/claude-sonnet-4",
+    primary: "openrouter/openai/gpt-5.2-codex",
     fallbacks: [
-      "openai/gpt-4o",
-      "google/gemini-2.5-pro",
+      "openrouter/moonshotai/kimi-k2.5",
+      "openrouter/google/gemini-2.5-pro",
+      "openrouter/x-ai/grok-4-0709",
+      "openrouter/anthropic/claude-sonnet-4",
     ],
   },
   [Tier.COMPLEX]: {
-    primary: "anthropic/claude-sonnet-4-6",
+    primary: "openrouter/anthropic/claude-opus-4",
     fallbacks: [
-      "anthropic/claude-sonnet-4",
-      "openai/gpt-4o",
-      "google/gemini-2.5-pro",
+      "openrouter/openai/gpt-5.2-codex",
+      "openrouter/anthropic/claude-sonnet-4",
+      "openrouter/google/gemini-3-pro-preview",
+      "openrouter/moonshotai/kimi-k2.5",
     ],
   },
   [Tier.REASONING]: {
-    primary: "openai/o3",
+    primary: "openrouter/anthropic/claude-sonnet-4",
     fallbacks: [
-      "deepseek/deepseek-r1-0528",
-      "openai/o3-mini",
+      "openrouter/anthropic/claude-opus-4",
+      "openrouter/openai/o4-mini",
+      "openrouter/openai/o3",
+      "openrouter/x-ai/grok-4-1-fast",
     ],
   },
 };
 
 const FREE_PROFILE: ProfileConfig = {
   [Tier.SIMPLE]: {
-    primary: "meta-llama/llama-3.3-70b-instruct:free",
+    primary: "openrouter/openai/gpt-oss-120b:free",
     fallbacks: [
-      "qwen/qwen3-4b:free",
-      "stepfun/step-3.5-flash:free",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/deepseek/deepseek-chat",
     ],
   },
   [Tier.MEDIUM]: {
-    primary: "meta-llama/llama-3.3-70b-instruct:free",
+    primary: "openrouter/openai/gpt-oss-120b:free",
     fallbacks: [
-      "stepfun/step-3.5-flash:free",
-      "arcee-ai/trinity-large-preview:free",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/deepseek/deepseek-chat",
     ],
   },
   [Tier.COMPLEX]: {
-    primary: "meta-llama/llama-3.3-70b-instruct:free",
+    primary: "openrouter/openai/gpt-oss-120b:free",
     fallbacks: [
-      "arcee-ai/trinity-large-preview:free",
-      "stepfun/step-3.5-flash:free",
+      "openrouter/google/gemini-2.5-flash",
+      "openrouter/deepseek/deepseek-chat",
     ],
   },
   [Tier.REASONING]: {
-    primary: "meta-llama/llama-3.3-70b-instruct:free",
+    primary: "openrouter/openai/gpt-oss-120b:free",
     fallbacks: [
-      "arcee-ai/trinity-large-preview:free",
-      "qwen/qwen3-4b:free",
+      "openrouter/deepseek/deepseek-reasoner",
+    ],
+  },
+};
+
+const AGENTIC_PROFILE: ProfileConfig = {
+  [Tier.SIMPLE]: {
+    primary: "openrouter/moonshotai/kimi-k2.5",
+    fallbacks: [
+      "openrouter/anthropic/claude-haiku-4.5",
+      "openrouter/x-ai/grok-code-fast-1",
+      "openrouter/openai/gpt-4o-mini",
+    ],
+  },
+  [Tier.MEDIUM]: {
+    primary: "openrouter/x-ai/grok-code-fast-1",
+    fallbacks: [
+      "openrouter/moonshotai/kimi-k2.5",
+      "openrouter/anthropic/claude-haiku-4.5",
+      "openrouter/anthropic/claude-sonnet-4",
+    ],
+  },
+  [Tier.COMPLEX]: {
+    primary: "openrouter/anthropic/claude-sonnet-4",
+    fallbacks: [
+      "openrouter/anthropic/claude-opus-4",
+      "openrouter/openai/gpt-5.2",
+      "openrouter/google/gemini-3-pro-preview",
+      "openrouter/x-ai/grok-4-0709",
+    ],
+  },
+  [Tier.REASONING]: {
+    primary: "openrouter/anthropic/claude-sonnet-4",
+    fallbacks: [
+      "openrouter/anthropic/claude-opus-4",
+      "openrouter/x-ai/grok-4-1-fast",
+      "openrouter/deepseek/deepseek-reasoner",
     ],
   },
 };
@@ -322,7 +383,7 @@ const FREE_PROFILE: ProfileConfig = {
 // Baseline model for savings comparison
 // ---------------------------------------------------------------------------
 
-export const BASELINE_MODEL_ID = "anthropic/claude-opus-4";
+export const BASELINE_MODEL_ID = "openrouter/anthropic/claude-opus-4";
 
 // ---------------------------------------------------------------------------
 // Full routing config
@@ -334,6 +395,7 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     eco: ECO_PROFILE,
     premium: PREMIUM_PROFILE,
     free: FREE_PROFILE,
+    agentic: AGENTIC_PROFILE,
   } as Record<RoutingProfile, ProfileConfig>,
   scoring: DEFAULT_SCORING_CONFIG,
   models: MODEL_REGISTRY,

@@ -12,6 +12,11 @@ import { createProxyServer } from "./proxy.js";
 const proxy = createProxyServer();
 
 proxy.start().then(() => {
+  const providerStatus = proxy.ctx.providers.status();
+  const directProviders = Object.entries(providerStatus)
+    .filter(([name, hasKey]) => hasKey && name !== "openrouter")
+    .map(([name]) => name);
+
   const banner = [
     "",
     "  ╭─────────────────────────────────────────╮",
@@ -24,8 +29,8 @@ proxy.start().then(() => {
     `  Models list    GET  /v1/models`,
     `  Health check   GET  /health`,
     "",
-    "  Set Authorization header to your OpenRouter API key.",
-    "  Set X-Smart-Router-Profile header to: auto | eco | premium | free",
+    `  Providers:     openrouter (fallback)${directProviders.length > 0 ? `, ${directProviders.join(", ")} (direct)` : ""}`,
+    "  Set X-Smart-Router-Profile header to: auto | eco | premium | free | agentic",
     "",
   ].join("\n");
 

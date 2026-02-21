@@ -19,7 +19,7 @@ export enum Tier {
 // Routing profiles
 // ---------------------------------------------------------------------------
 
-export type RoutingProfile = "auto" | "eco" | "premium" | "free";
+export type RoutingProfile = "auto" | "eco" | "premium" | "free" | "agentic";
 
 // ---------------------------------------------------------------------------
 // Scoring
